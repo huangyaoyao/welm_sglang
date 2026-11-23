@@ -568,6 +568,11 @@ class ServerArgs:
         "The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
         NS("model"),
     ] = None
+    model_execution_backend: A[
+        Literal["native", "megakernel-native"],
+        "Execute fixed WeLM decode and draft buckets with SGLang or MegaKernel Native.",
+        NS("model"),
+    ] = "native"
     model_impl: A[
         str,
         Arg(
@@ -4210,6 +4215,14 @@ class ServerArgs:
             from sglang.srt.hardware_backend.npu.utils import set_default_server_args
 
             set_default_server_args(self)
+
+            if self.model_execution_backend == "megakernel-native":
+                if (
+                    (Phase.PREFILL, "backend") in self._cuda_graph_config_locked
+                    and self.cuda_graph_config.prefill.backend != Backend.DISABLED
+                ):
+                    raise ValueError("megakernel-native requires eager prefill")
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
             current = self.cuda_graph_config.prefill.tc_compiler
             if current is not None and current != "eager":
@@ -8880,6 +8893,15 @@ class ServerArgs:
             )
 
     def check_server_args(self):
+        if self.model_execution_backend == "megakernel-native":
+            if self.device != "npu":
+                raise ValueError("megakernel-native requires --device npu")
+            if self.disable_cuda_graph or self.cuda_graph_config.decode.backend != Backend.FULL:
+                raise ValueError("megakernel-native requires full decode buckets")
+            if self.enable_torch_compile:
+                raise ValueError("megakernel-native captures eager operators")
+            if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                raise ValueError("megakernel-native requires eager prefill")
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (

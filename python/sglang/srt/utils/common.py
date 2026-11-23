@@ -975,21 +975,38 @@ def get_compiler_backend(mode=None) -> str:
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        try:
-            import torchair
-            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
-            from torchair.configs.compiler_config import CompilerConfig
-        except ImportError:
-            raise ImportError(
-                "NPU detected, but torchair package is not installed. "
-                "Please install torchair for torch.compile support on NPU."
-            )
-        compiler_config = CompilerConfig()
-        compiler_config.mode = "max-autotune"
-        if mode == "npugraph_ex":
-            compiler_config.mode = "reduce-overhead"
-            compiler_config.debug.run_eagerly = True
-        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
+        # NPU decorators request a backend at import time, before ServerArgs is
+        # published. Defer TorchAir until a caller actually compiles with it.
+        compiled = None
+
+        def npu_backend(graph, example_inputs, **kwargs):
+            nonlocal compiled
+            from sglang.srt.runtime_context import get_model
+
+            try:
+                execution = getattr(get_model(), "model_execution_backend", "native")
+            except ValueError:  # No server configuration in standalone use.
+                execution = "native"
+            if execution == "megakernel-native":
+                return graph.forward
+            if compiled is None:
+                try:
+                    import torchair
+                    import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+                    from torchair.configs.compiler_config import CompilerConfig
+                except ImportError:
+                    raise ImportError(
+                        "NPU detected, but torchair package is not installed. "
+                        "Please install torchair for torch.compile support on NPU."
+                    )
+                compiler_config = CompilerConfig()
+                compiler_config.mode = "max-autotune"
+                if mode == "npugraph_ex":
+                    compiler_config.mode = "reduce-overhead"
+                    compiler_config.debug.run_eagerly = True
+                compiled = torchair.get_npu_backend(compiler_config=compiler_config)
+            return compiled(graph, example_inputs, **kwargs)
+
         return npu_backend
 
     return "inductor"

@@ -950,6 +950,7 @@ class ModelRunner:
         # Other execution modes retain the existing coarse WAR fallback.
         self.welm_graph_read_done_enabled = (
             self.war_required_for_welm
+            and self.server_args.model_execution_backend != "megakernel-native"
             and not self.server_args.enable_pdmux
             and not self.server_args.enable_two_batch_overlap
             and not self.server_args.enable_torch_compile
