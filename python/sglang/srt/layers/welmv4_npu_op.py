@@ -2197,6 +2197,32 @@ def _welmv4_oe_hash_prefill_4way_kernel(
         )
 
 
+@triton.jit
+def _welmv4_oe_load_rows(ptr, indices, batch_size, full_tile, valid, PADDED_OUTPUT: tl.constexpr):
+    if PADDED_OUTPUT:
+        # The SIMD backend can implement a masked load as a full load followed
+        # by a select. Clamp addresses before loading from a compact tail.
+        if full_tile:
+            values = tl.load(ptr + indices)
+        else:
+            safe_indices = tl.minimum(indices, batch_size - 1)
+            values = tl.where(valid, tl.load(ptr + safe_indices), 0)
+    else:
+        values = tl.load(ptr + indices, mask=valid, other=0)
+    return values
+
+
+@triton.jit
+def _welmv4_oe_load_history(ptr, offsets, valid, PADDED_OUTPUT: tl.constexpr):
+    if PADDED_OUTPUT:
+        # Positions 0 and 1 can form negative history offsets. The table
+        # is nonempty on this path, so invalid lanes may safely read row 0.
+        values = tl.where(valid, tl.load(ptr + tl.where(valid, offsets, 0)), 0)
+    else:
+        values = tl.load(ptr + offsets, mask=valid, other=0)
+    return values
+
+
 @triton.jit(do_not_specialize=["batch_size", "num_tasks"])
 def _welmv4_oe_hash_decode_4way_kernel(
     input_ids_ptr,
@@ -2214,6 +2240,7 @@ def _welmv4_oe_hash_decode_4way_kernel(
     OE_V3: tl.constexpr,
     HASH_MUL: tl.constexpr,
     BLOCK_B: tl.constexpr,
+    PADDED_OUTPUT: tl.constexpr = False,
 ):
     """Decode specialization: one current token per real request."""
     pid = tl.program_id(0)
@@ -2222,53 +2249,56 @@ def _welmv4_oe_hash_decode_4way_kernel(
     task_start = pid * tasks_per_program
     task_end = tl.minimum(task_start + tasks_per_program, num_tasks)
     base_offsets = tl.arange(0, BLOCK_B)
+    plane_pitch = num_tasks * BLOCK_B if PADDED_OUTPUT else batch_size
 
     for task_idx in range(task_start, task_end):
-        req_indices = task_idx * BLOCK_B + base_offsets
+        tile_start = task_idx * BLOCK_B
+        req_indices = tile_start + base_offsets
+        full_tile = tile_start + BLOCK_B <= batch_size
         request_mask = req_indices.to(tl.float32) < batch_size
-        request_rows = tl.load(
-            req_rows_ptr + req_indices, mask=request_mask, other=0
+        request_rows = _welmv4_oe_load_rows(
+            req_rows_ptr, req_indices, batch_size, full_tile, request_mask, PADDED_OUTPUT
         ).to(tl.int32)
-        positions = tl.load(
-            column_starts_ptr + req_indices, mask=request_mask, other=0
+        positions = _welmv4_oe_load_rows(
+            column_starts_ptr, req_indices, batch_size, full_tile, request_mask, PADDED_OUTPUT
         ).to(tl.int32)
-        current = tl.load(
-            input_ids_ptr + req_indices, mask=request_mask, other=0
+        current = _welmv4_oe_load_rows(
+            input_ids_ptr, req_indices, batch_size, full_tile, request_mask, PADDED_OUTPUT
         ).to(tl.uint32)
-        previous1 = tl.load(
-            token_table_ptr + request_rows * context_len + positions - 1,
-            mask=request_mask & (positions.to(tl.float32) >= 1.0),
-            other=0,
+        history = (request_rows * context_len).to(tl.int64) + positions
+        previous1 = _welmv4_oe_load_history(
+            token_table_ptr, history - 1,
+            request_mask & (positions.to(tl.float32) >= 1.0), PADDED_OUTPUT,
         ).to(tl.uint32)
-        previous2 = tl.load(
-            token_table_ptr + request_rows * context_len + positions - 2,
-            mask=request_mask & (positions.to(tl.float32) >= 2.0),
-            other=0,
+        previous2 = _welmv4_oe_load_history(
+            token_table_ptr, history - 2,
+            request_mask & (positions.to(tl.float32) >= 2.0), PADDED_OUTPUT,
         ).to(tl.uint32)
 
         packed2 = current + previous1 * VOCAB_SIZE
         packed3 = packed2 + previous2 * VOCAB_SIZE * VOCAB_SIZE
         hash2 = (packed2 * HASH_MUL).to(tl.uint32)
         hash3 = (packed3 * HASH_MUL).to(tl.uint32)
+        output_mask = None if PADDED_OUTPUT else request_mask
         tl.store(
             hashed_out_ptr + req_indices,
             _welmv4_u32_remainder(hash2, OE_V0).to(tl.int32),
-            mask=request_mask,
+            mask=output_mask,
         )
         tl.store(
-            hashed_out_ptr + batch_size + req_indices,
+            hashed_out_ptr + plane_pitch + req_indices,
             _welmv4_u32_remainder(hash2, OE_V1).to(tl.int32),
-            mask=request_mask,
+            mask=output_mask,
         )
         tl.store(
-            hashed_out_ptr + 2 * batch_size + req_indices,
+            hashed_out_ptr + 2 * plane_pitch + req_indices,
             _welmv4_u32_remainder(hash3, OE_V2).to(tl.int32),
-            mask=request_mask,
+            mask=output_mask,
         )
         tl.store(
-            hashed_out_ptr + 3 * batch_size + req_indices,
+            hashed_out_ptr + 3 * plane_pitch + req_indices,
             _welmv4_u32_remainder(hash3, OE_V3).to(tl.int32),
-            mask=request_mask,
+            mask=output_mask,
         )
 
 
@@ -2287,6 +2317,7 @@ def _welmv4_oe_hash_explicit_history_4way_kernel(
     OE_V3: tl.constexpr,
     HASH_MUL: tl.constexpr,
     BLOCK_B: tl.constexpr,
+    PADDED_OUTPUT: tl.constexpr = False,
 ):
     """Hash one draft token per request using draft-local history."""
     pid = tl.program_id(0)
@@ -2295,40 +2326,46 @@ def _welmv4_oe_hash_explicit_history_4way_kernel(
     task_start = pid * tasks_per_program
     task_end = tl.minimum(task_start + tasks_per_program, num_tasks)
     base_offsets = tl.arange(0, BLOCK_B)
+    plane_pitch = num_tasks * BLOCK_B if PADDED_OUTPUT else batch_size
 
     for task_idx in range(task_start, task_end):
-        indices = task_idx * BLOCK_B + base_offsets
+        tile_start = task_idx * BLOCK_B
+        indices = tile_start + base_offsets
+        full_tile = tile_start + BLOCK_B <= batch_size
         mask = indices.to(tl.float32) < batch_size
-        current = tl.load(current_ptr + indices, mask=mask, other=0).to(tl.uint32)
-        previous1 = tl.load(previous1_ptr + indices, mask=mask, other=0).to(
-            tl.uint32
-        )
-        previous2 = tl.load(previous2_ptr + indices, mask=mask, other=0).to(
-            tl.uint32
-        )
+        current = _welmv4_oe_load_rows(
+            current_ptr, indices, batch_size, full_tile, mask, PADDED_OUTPUT
+        ).to(tl.uint32)
+        previous1 = _welmv4_oe_load_rows(
+            previous1_ptr, indices, batch_size, full_tile, mask, PADDED_OUTPUT
+        ).to(tl.uint32)
+        previous2 = _welmv4_oe_load_rows(
+            previous2_ptr, indices, batch_size, full_tile, mask, PADDED_OUTPUT
+        ).to(tl.uint32)
         packed2 = current + previous1 * VOCAB_SIZE
         packed3 = packed2 + previous2 * VOCAB_SIZE * VOCAB_SIZE
         hash2 = (packed2 * HASH_MUL).to(tl.uint32)
         hash3 = (packed3 * HASH_MUL).to(tl.uint32)
+        output_mask = None if PADDED_OUTPUT else mask
         tl.store(
             hashed_out_ptr + indices,
             _welmv4_u32_remainder(hash2, OE_V0).to(tl.int32),
-            mask=mask,
+            mask=output_mask,
         )
         tl.store(
-            hashed_out_ptr + batch_size + indices,
+            hashed_out_ptr + plane_pitch + indices,
             _welmv4_u32_remainder(hash2, OE_V1).to(tl.int32),
-            mask=mask,
+            mask=output_mask,
         )
         tl.store(
-            hashed_out_ptr + 2 * batch_size + indices,
+            hashed_out_ptr + 2 * plane_pitch + indices,
             _welmv4_u32_remainder(hash3, OE_V2).to(tl.int32),
-            mask=mask,
+            mask=output_mask,
         )
         tl.store(
-            hashed_out_ptr + 3 * batch_size + indices,
+            hashed_out_ptr + 3 * plane_pitch + indices,
             _welmv4_u32_remainder(hash3, OE_V3).to(tl.int32),
-            mask=mask,
+            mask=output_mask,
         )
 
 
@@ -2547,6 +2584,23 @@ def welmv4_oe_hash_prefill_4way_npu(
     return output
 
 
+def _welmv4_oe_hash_output(batch_size, block_b, device, *, can_pad=True):
+    from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        welm_decode_tiles_active,
+    )
+
+    # Full, disjoint stores avoid read-modify-write and the Triton launch locks
+    # it requires. Apply the SIMD specialization only to MK's tested tile size.
+    if can_pad and welm_decode_tiles_active() and block_b == 128 and batch_size > 0:
+        pitch = triton.cdiv(batch_size, block_b) * block_b
+        launch_options = dict(PADDED_OUTPUT=True, compile_mode="simd")
+    else:
+        pitch = batch_size
+        launch_options = {}
+    output = torch.empty((_WELMV4_OE_BRANCHES, pitch), dtype=torch.int32, device=device)
+    return output, launch_options
+
+
 def welmv4_oe_hash_decode_4way_npu(
     input_ids: torch.Tensor,
     token_table: torch.Tensor,
@@ -2567,10 +2621,8 @@ def welmv4_oe_hash_decode_4way_npu(
         or column_starts.numel() < batch_size
     ):
         raise ValueError("decode metadata must contain at least batch_size entries")
-    output = torch.empty(
-        (_WELMV4_OE_BRANCHES, batch_size),
-        dtype=torch.int32,
-        device=input_ids.device,
+    output, launch_options = _welmv4_oe_hash_output(
+        batch_size, block_b, input_ids.device, can_pad=token_table.numel() > 0
     )
     if batch_size == 0:
         return output
@@ -2593,8 +2645,9 @@ def welmv4_oe_hash_decode_4way_npu(
         OE_V3=oe_v3,
         HASH_MUL=_WELMV4_OE_HASH_MULTIPLIER,
         BLOCK_B=block_b,
+        **launch_options,
     )
-    return output
+    return output[:, :batch_size] if output.shape[1] != batch_size else output
 
 
 def welmv4_oe_hash_explicit_history_4way_npu(
@@ -2613,11 +2666,7 @@ def welmv4_oe_hash_explicit_history_4way_npu(
     batch_size = current.numel()
     if previous1.numel() != batch_size or previous2.numel() != batch_size:
         raise ValueError("draft-local OE history must have one row per token")
-    output = torch.empty(
-        (_WELMV4_OE_BRANCHES, batch_size),
-        dtype=torch.int32,
-        device=current.device,
-    )
+    output, launch_options = _welmv4_oe_hash_output(batch_size, block_b, current.device)
     if batch_size == 0:
         return output
     num_tasks = triton.cdiv(batch_size, block_b)
@@ -2637,8 +2686,9 @@ def welmv4_oe_hash_explicit_history_4way_npu(
         OE_V3=oe_v3,
         HASH_MUL=_WELMV4_OE_HASH_MULTIPLIER,
         BLOCK_B=block_b,
+        **launch_options,
     )
-    return output
+    return output[:, :batch_size] if output.shape[1] != batch_size else output
 
 
 def welmv4_token_table_ragged_update_npu(

@@ -1,30 +1,35 @@
 """Access contracts for WeLM over-encoding in fixed decode and draft buckets."""
 
 
-def _hash_rows(inputs, output, batch, tasks, block, shared=()):
+def _hash_rows(inputs, output, batch, tasks, block, shared=(), *, padded=False):
+    extent = tasks * block if padded else batch
     if (
         batch < 1 or block < 1 or tasks != (batch + block - 1) // block
         or any(t.numel() != batch for t in inputs)
-        or output.shape != (4, batch)
+        or output.shape != (4, extent)
     ):
         return None
-    # The four stores in the source kernel are separated by batch elements.
-    # Treating the output as [batch, 4] would give the wrong inter-program edges.
+    # Each plane is written independently. A full final tile includes padding,
+    # whereas the request metadata and the history views contain valid rows only.
+    planes = (output, 4, output.element_size())
+    if padded:
+        planes += (extent,)
     return dict(count=batch, block=block,
                 reads=[(t, t.element_size()) for t in inputs], writes=[],
-                plane_writes=[(output, 4, output.element_size())],
-                shared_reads=list(shared))
+                plane_writes=[planes], shared_reads=list(shared))
 
 
 def _decode_hash(ids, table, requests, positions, output, batch, context, tasks,
-                 *, BLOCK_B, **constants):
+                 *, BLOCK_B, PADDED_OUTPUT=False, **constants):
     if len(table.shape) != 2 or table.shape[1] != context:
         return None
-    return _hash_rows((ids, requests, positions), output, batch, tasks, BLOCK_B, (table,))
+    return _hash_rows((ids, requests, positions), output, batch, tasks, BLOCK_B, (table,),
+                      padded=PADDED_OUTPUT)
 
 
-def _draft_hash(ids, previous1, previous2, output, batch, tasks, *, BLOCK_B, **constants):
-    return _hash_rows((ids, previous1, previous2), output, batch, tasks, BLOCK_B)
+def _draft_hash(ids, previous1, previous2, output, batch, tasks, *, BLOCK_B, PADDED_OUTPUT=False, **constants):
+    return _hash_rows((ids, previous1, previous2), output, batch, tasks, BLOCK_B,
+                      padded=PADDED_OUTPUT)
 
 
 def _verify_hash(ids, table, requests, offsets, lengths, starts, output, tokens,

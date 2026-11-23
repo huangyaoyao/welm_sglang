@@ -16,6 +16,10 @@ def decode_tile_scope():
         _decode_active.reset(token)
 
 
+def welm_decode_tiles_active():
+    return _decode_active.get()
+
+
 def _decode_native(*, tile_layout, **options):
     from megakernel.triton import native
 
@@ -27,7 +31,7 @@ def _decode_native(*, tile_layout, **options):
         # declared byte extent against both the view and its owning storage.
         return dict(layout, allow_subviews=True)
 
-    return native(enabled=_decode_active.get, tile_layout=decode_layout, **options)
+    return native(enabled=welm_decode_tiles_active, tile_layout=decode_layout, **options)
 
 
 def _k_norm_layout(

@@ -29,6 +29,22 @@ class OeTileTest(unittest.TestCase):
         self.assertIsNone(oe["_decode_hash"](
             ids, table, rows, starts, tensor((257, 4)), 257, 128, 3, BLOCK_B=128))
 
+    def test_decode_and_draft_describe_full_output_tiles_with_compact_inputs(self):
+        ids, rows, starts = [tensor((259,)) for _ in range(3)]
+        table, out = tensor((259, 16)), tensor((4, 384))
+        decode = oe["_decode_hash"](
+            ids, table, rows, starts, out, 259, 16, 3, BLOCK_B=128,
+            PADDED_OUTPUT=True,
+        )
+        draft = oe["_draft_hash"](
+            ids, rows, starts, out, 259, 3, BLOCK_B=128, PADDED_OUTPUT=True,
+        )
+        for layout in (decode, draft):
+            self.assertEqual(layout["count"], 259)
+            self.assertEqual(layout["reads"], [(ids, 4), (rows, 4), (starts, 4)])
+            self.assertEqual(layout["plane_writes"], [(out, 4, 4, 384)])
+        self.assertEqual(decode["shared_reads"], [table])
+
     def test_draft_verify_keeps_indirect_offsets_opaque(self):
         history = [tensor((16,)) for _ in range(3)]
         out = tensor((4, 16))
@@ -77,40 +93,54 @@ class OeTileDeviceTest(unittest.TestCase):
             welmv4_oe_hash_decode_4way_npu, welmv4_oe_hash_explicit_history_4way_npu,
         )
 
-        batch, context = 259, 16  # Three programs with a masked tail.
-        options = dict(vocab_size=32000, oe_vocab_sizes=(997, 991, 983, 977))
-        gen = torch.Generator().manual_seed(27)
-        table = torch.randint(32000, (batch, context), dtype=torch.int32, generator=gen).to("npu")
-        with torch.inference_mode(), TemporaryDirectory() as build:
-            def forward(ids, req, pos, previous):
-                hashed = welmv4_oe_hash_decode_4way_npu(ids, table, req, pos, **options)
-                return hashed, welmv4_oe_hash_explicit_history_4way_npu(
-                    hashed[0], previous, ids, **options)
+        context = 16
+        for batch in (1, 256, 259, 513):
+            with self.subTest(batch=batch):
+                pitch = ((batch + 127) // 128) * 128
+                options = dict(vocab_size=32000, oe_vocab_sizes=(997, 991, 983, 977))
+                gen = torch.Generator().manual_seed(27)
+                table = torch.randint(32000, (batch, context), dtype=torch.int32, generator=gen).to("npu")
+                with torch.inference_mode(), TemporaryDirectory() as build:
+                    def forward(ids, req, pos, previous):
+                        hashed = welmv4_oe_hash_decode_4way_npu(ids, table, req, pos, **options)
+                        draft_args = (ids, hashed[0], previous) if batch == 256 else (
+                            hashed[0], previous, ids
+                        )
+                        return hashed, welmv4_oe_hash_explicit_history_4way_npu(
+                            *draft_args, **options)
 
-            examples = []
-            for _ in range(3):
-                values = [torch.randint(32000, (batch,), generator=gen, dtype=torch.int32),
-                          torch.randperm(batch, generator=gen, dtype=torch.int32),
-                          torch.randint(context, (batch,), generator=gen, dtype=torch.int32),
-                          torch.randint(32000, (batch,), generator=gen, dtype=torch.int32)]
-                operands = tuple(t.to("npu") for t in values)
-                expected = tuple(t.cpu() for t in forward(*operands))
-                examples.append((operands, expected))
-            fixed = tuple(t.clone() for t in examples[0][0])
-            install_welm_tile_layouts()
-            with decode_tile_scope():
-                graph = capture_fixed(lambda: forward(*fixed), build, tile_chains=True)
-            try:
-                self.assertEqual(graph.host_boundary_count, 0, graph.execution_summary)
-                self.assertEqual(graph.scope_count, 1)
-                self.assertEqual(graph.plans[0].tile_dependencies, [(0, 1)])
-                for operands, expected in examples:
-                    for dst, src in zip(fixed, operands):
-                        dst.copy_(src)
-                    for result, eager in zip(graph.replay(), expected):
-                        torch.testing.assert_close(result.cpu(), eager, rtol=0, atol=0)
-            finally:
-                graph.reset()
+                    examples = []
+                    for step in range(3):
+                        values = [torch.randint(32000, (batch,), generator=gen, dtype=torch.int64),
+                                  torch.randperm(batch, generator=gen, dtype=torch.int64),
+                                  torch.arange(batch, dtype=torch.int32).roll(step) % context,
+                                  torch.randint(32000, (batch,), generator=gen, dtype=torch.int64)]
+                        operands = tuple(t.to("npu") for t in values)
+                        eager = forward(*operands)
+                        self.assertTrue(all(t.is_contiguous() for t in eager))
+                        expected = tuple(t.cpu() for t in eager)
+                        examples.append((operands, expected))
+                    fixed = tuple(t.clone() for t in examples[0][0])
+                    install_welm_tile_layouts()
+                    with decode_tile_scope():
+                        graph = capture_fixed(lambda: forward(*fixed), build, tile_chains=True)
+                    try:
+                        self.assertEqual(graph.host_boundary_count, 0, graph.execution_summary)
+                        self.assertEqual(graph.scope_count, 1)
+                        self.assertEqual(graph.plans[0].tile_dependencies, [(0, 1)] if batch > 128 else [])
+                        for operands, expected in examples:
+                            for dst, src in zip(fixed, operands):
+                                dst.copy_(src)
+                            for result, eager in zip(graph.replay(), expected):
+                                self.assertEqual(result.shape, (4, batch))
+                                self.assertEqual(result.stride(), (pitch, 1))
+                                if pitch != batch:
+                                    full = result.as_strided((4, pitch), (pitch, 1))
+                                    padding = full[:, batch:].cpu()
+                                    self.assertTrue(torch.equal(padding, torch.zeros_like(padding)))
+                                torch.testing.assert_close(result.cpu(), eager, rtol=0, atol=0)
+                    finally:
+                        graph.reset()
 
 
 if __name__ == "__main__":
