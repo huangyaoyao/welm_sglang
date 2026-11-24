@@ -4,12 +4,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
 
-_decode_active = ContextVar("welm_native_decode_tiles", default=False)
+_decode_active = ContextVar("welm_native_decode_tiles", default=None)
 
 
 @contextmanager
 def decode_tile_scope():
-    token = _decode_active.set(True)
+    token = _decode_active.set({})
     try:
         yield
     finally:
@@ -17,6 +17,11 @@ def decode_tile_scope():
 
 
 def welm_decode_tiles_active():
+    return _decode_active.get() is not None
+
+
+def welm_decode_tile_workspace():
+    """Scratch shared by layers of this capture, isolated from other plans."""
     return _decode_active.get()
 
 

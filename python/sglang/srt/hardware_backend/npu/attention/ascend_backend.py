@@ -400,6 +400,9 @@ class AscendAttnBackend(AttentionBackend):
         self.use_welm_flash_attn = self.is_welm_v4 and get_bool_env_var(
             "WELM_NPU_USE_FLASH_ATTN", "False"
         )
+        self.use_mk_paged_kv = self.use_welm_flash_attn and get_bool_env_var(
+            "SGLANG_NPU_WELMV4_MK_PAGED_KV", "False"
+        )
         if self.use_welm_flash_attn:
             # Optional dependency: the default Triton path does not import it.
             import cann_ops_transformer
@@ -1474,6 +1477,22 @@ class AscendAttnBackend(AttentionBackend):
         """Capture ordinary decode metadata from fixed registry input buffers."""
         metadata = self.forward_metadata
         seq_lens = forward_batch.seq_lens
+        if self.page_size == 64 and seq_lens.shape == (2,):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+                welm_decode_tiles_active,
+            )
+
+            if welm_decode_tiles_active():
+                from sglang.srt.hardware_backend.npu.graph_runner.welm_paged_kv import prepare_flash_pages
+
+                if prepare_flash_pages(
+                    self.req_to_token, forward_batch.req_pool_indices, seq_lens,
+                    forward_batch.out_cache_loc, metadata.block_tables,
+                    metadata.welm_flash_seqused_q, metadata.welm_flash_seqused_kv,
+                    self.full_to_swa_index_mapping if self.is_hybrid_swa else None,
+                    metadata.block_tables_swa, metadata.swa_out_cache_loc,
+                ):
+                    return
         valid_rows = seq_lens > 0
         self._prepare_welm_graph_page_tables_device(
             metadata,
@@ -3716,6 +3735,38 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output
 
+    def _stage_welm_decode_kv(self, layer, batch, k, v):
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+            welm_decode_tile_workspace,
+        )
+
+        workspace = welm_decode_tile_workspace()
+        if (workspace is None or k is None or v is None or batch.batch_size != 2
+                or not self.capture_welm_decode_metadata
+                or not batch.forward_mode.is_decode() or self.page_size != 64
+                or (layer.tp_k_head_num, layer.qk_head_dim) != (2, 256)
+                or (layer.tp_v_head_num, layer.v_head_dim) != (2, 256)):
+            return None
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_paged_kv import stage_flash_kv
+
+        pool = self.token_to_kv_pool
+        slots, table = batch.out_cache_loc, self.forward_metadata.block_tables
+        if type(pool) is SWAKVPool:
+            _, swa = pool.layers_mapping[layer.layer_id]
+            if swa:
+                slots = self.forward_metadata.swa_out_cache_loc
+                table = self.forward_metadata.block_tables_swa
+            pool = pool.swa_kv_pool if swa else pool.full_kv_pool
+        if (type(pool) is not NPUMHATokenToKVPool or not pool.use_fia
+                or not pool.use_scatter_pa_kv_cache or pool.store_dtype != torch.bfloat16):
+            return None
+        keys = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 64, 2, 256)
+        values = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view_as(keys)
+        return stage_flash_kv(k, v, slots, keys, values, table,
+                              self.forward_metadata.welm_flash_seqused_kv,
+                              workspace)
+
     def forward_decode_graph(
         self,
         q: torch.Tensor,
@@ -3728,6 +3779,10 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        if save_kv_cache and self.use_mk_paged_kv and not self.use_mla:
+            operands = self._stage_welm_decode_kv(layer, forward_batch, k, v)
+            if operands is not None:
+                return self._forward_welm_flash_attention(q, *operands, layer, sinks)
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
