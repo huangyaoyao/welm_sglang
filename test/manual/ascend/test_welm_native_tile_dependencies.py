@@ -11,6 +11,12 @@ from unittest.mock import patch
 
 class WelmNativeTileTest(unittest.TestCase):
     def test_changed_rows_match_eager_with_a_tile_edge(self):
+        self._check_changed_rows(packed=False)
+
+    def test_packed_qkv_key_matches_dense_eager(self):
+        self._check_changed_rows(packed=True)
+
+    def _check_changed_rows(self, packed):
         try:
             import torch
             import torch_npu
@@ -20,6 +26,7 @@ class WelmNativeTileTest(unittest.TestCase):
             self.skipTest("requires an Ascend A5 NPU")
 
         from megakernel._fixed import capture_fixed
+        from megakernel.ops.tensor_copy import copy_kernel
         from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
             decode_tile_scope, install_welm_tile_layouts,
         )
@@ -47,21 +54,37 @@ class WelmNativeTileTest(unittest.TestCase):
                 examples.append((q, k, positions, q_ref.cpu(), k_ref.cpu()))
 
             q, k, positions = (t.to("npu") for t in examples[0][:3])
+            def captured():
+                if packed:
+                    copy_kernel[(rows,)](source, storage, source.numel(), BLOCK=32 * dim, ROUND_FP32=False)
+                return forward(q, k, positions)
+
+            if packed:
+                # The packed Q and V columns contain sentinels on both sides of K.
+                storage = torch.full((rows, 32, dim), -7.0, dtype=k.dtype, device=k.device)
+                source = storage.clone()
+                k = storage[:, 24:26]
+                source[:, 24:26].copy_(examples[0][1])
             install_welm_tile_layouts()
             with (
                 decode_tile_scope(),
                 patch.object(torch.npu, "NPUGraph", side_effect=AssertionError("unexpected NPUGraph")),
                 patch.object(torch.npu, "graph", side_effect=AssertionError("unexpected ACL Graph")),
             ):
-                plan = capture_fixed(lambda: forward(q, k, positions), directory)
+                plan = capture_fixed(captured, directory, tile_chains=True)
                 try:
                     self.assertEqual(plan.scope_count, 1, plan.execution_summary)
-                    self.assertEqual(plan.fused_operator_count, 2, plan.execution_summary)
+                    self.assertEqual(plan.fused_operator_count, 3 if packed else 2, plan.execution_summary)
                     self.assertEqual(plan.host_boundary_count, 0, plan.execution_summary)
-                    self.assertEqual(plan.plans[0].tile_dependencies, [(0, 1)])
+                    expected_edges = [(0, 1), (1, 2)] if packed else [(0, 1)]
+                    self.assertEqual(plan.plans[0].tile_dependencies, expected_edges)
                     for q_input, k_input, pos, q_ref, k_ref in examples:
                         q.copy_(q_input)
-                        k.copy_(k_input)
+                        if packed:
+                            source[:, 24:26].copy_(k_input)
+                            storage.zero_()
+                        else:
+                            k.copy_(k_input)
                         positions.copy_(pos)
                         q_out, k_out = plan.replay()
                         # Check every row and every head, including the untouched RoPE prefix.

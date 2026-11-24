@@ -57,6 +57,14 @@ class WelmLayoutContractTest(unittest.TestCase):
             with self.subTest(override=override):
                 self.assertIsNone(CONTRACT["_k_norm_layout"](**(self.norm_args | override)))
 
+    def test_k_norm_reads_whole_packed_row_and_writes_only_k(self):
+        packed = Tensor((8, 7168), 2)
+        args = self.norm_args | dict(x=packed, x_stride=7168, x_column=6144)
+        layout = CONTRACT["_k_norm_layout"](**args)
+        self.assertEqual(layout["reads"], [(packed, 14336)])
+        self.assertEqual(layout["writes"], [(self.norm, 1024)])
+        self.assertIsNone(CONTRACT["_k_norm_layout"](**(args | dict(x_column=7000))))
+
     def test_rope_excludes_mirror_indices_and_nonmatching_row_layouts(self):
         for override in (dict(last_index=self.positions), dict(last_query_rows=8),
                          dict(q=Tensor((4, 24, 256), 2)), dict(k_stride=1024),

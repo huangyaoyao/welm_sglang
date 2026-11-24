@@ -684,6 +684,7 @@ def mmq_style_k_rms_norm_kernel(
     out_token_stride: int,
     eps: float,
     KV_HEADS_BLOCK: tl.constexpr,  # pylint: disable=invalid-name
+    x_column: tl.constexpr = 0,
 ):
     head_dim_offs = tl.arange(0, head_dim)
     kv_head_offs = tl.arange(0, KV_HEADS_BLOCK)
@@ -693,7 +694,7 @@ def mmq_style_k_rms_norm_kernel(
     for token_id in tl.range(
         tl.program_id(0), tokens, tl.num_programs(0), num_stages=4
     ):
-        in_offs = token_id * x_token_stride.to(tl.int64) + block_offs
+        in_offs = token_id * x_token_stride.to(tl.int64) + x_column + block_offs
         x = tl.load(
             x_ptr + in_offs, mask=kv_head_offs[:, None] < kv_heads, other=0.0
         ).to(tl.float32)
@@ -705,27 +706,51 @@ def mmq_style_k_rms_norm_kernel(
         tl.store(out_ptr + out_offs, out, mask=kv_head_offs[:, None] < kv_heads)
 
 
+def _packed_k_norm_input(x: torch.Tensor):
+    """Expose complete packed rows during MK decode; K starts at column."""
+    if x.is_contiguous():
+        return x, 0
+    if is_npu():
+        import torch_npu
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+            welm_decode_tiles_active,
+        )
+
+        tokens, heads, dim = x.shape
+        pitch = x.stride(0)
+        if (welm_decode_tiles_active() and x.stride()[1:] == (dim, 1)
+                and pitch >= heads * dim > 0 and torch_npu.get_npu_format(x) == 2):
+            offset = x.storage_offset()
+            column = offset % pitch
+            start = offset - column
+            end = (start + tokens * pitch) * x.element_size()
+            if column + heads * dim <= pitch and end <= x.untyped_storage().nbytes():
+                return x.as_strided((tokens, pitch), (pitch, 1), start), column
+    return x.contiguous(), 0
+
+
 def mmq_style_k_rms_norm(
     x: torch.Tensor,
     gamma: torch.Tensor,
     eps: float,
 ):
     assert x.dim() == 3
-    assert x.is_contiguous()
-    output = torch.empty_like(x)
     tokens, kv_heads, head_dim = x.shape
+    source, column = _packed_k_norm_input(x)
+    output = torch.empty_like(x) if source.ndim == 3 and source is x else x.new_empty(x.shape)
     num_sms = min(tokens, _get_num_sms())
     mmq_style_k_rms_norm_kernel[(num_sms,)](
-        x,
+        source,
         gamma,
         output,
         tokens,
         kv_heads,
         head_dim,
-        x.stride(0),
+        source.stride(0),
         output.stride(0),
         eps,
         triton.next_power_of_2(kv_heads),
+        column,
     )
     return output
 

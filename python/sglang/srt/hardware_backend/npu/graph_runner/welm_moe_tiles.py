@@ -102,6 +102,40 @@ _KERNELS = (
 )
 
 
+class _ActiveRowGrid:
+    """Limit audited row kernels to the allocation's capacity during MK decode."""
+
+    def __init__(self, kernel, layout, enabled):
+        self.kernel = kernel
+        self.layout = layout
+        self.enabled = enabled
+
+    def __getattr__(self, name):
+        return getattr(self.kernel, name)
+
+    def __getitem__(self, grid):
+        if not self.enabled() or not isinstance(grid, tuple) or len(grid) != 1:
+            return self.kernel[grid]
+
+        def launch(*args, **kwargs):
+            # The external launchers pass rows positionally. Preserve other ABIs.
+            if not args or type(grid[0]) is not int:
+                return self.kernel[grid](*args, **kwargs)
+            rows = args[0].shape[0]
+            if 0 < rows < grid[0]:
+                if (self.layout is _routing_l1_layout and len(args) == 5
+                        and args[2] == rows and args[4] == grid[0]):
+                    return self.kernel[(rows,)](*args[:4], rows, **kwargs)
+                if (self.layout is _expert_swiglu_layout and len(args) == 4
+                        and kwargs.get("GROUP_LIST_TYPE") == 1 and kwargs.get("NUM_CORES") == grid[0]):
+                    # For every legal nonempty dispatch, ceil(active / rows)
+                    # and ceil(active / original_cores) both equal one.
+                    return self.kernel[(rows,)](*args, **dict(kwargs, NUM_CORES=rows))
+            return self.kernel[grid](*args, **kwargs)
+
+        return launch
+
+
 @lru_cache(maxsize=None)
 def _install(module, name, layout, source_hash, native):
     kernel = getattr(module, name, None)
@@ -113,7 +147,12 @@ def _install(module, name, layout, source_hash, native):
         if not isinstance(src, str) or sha256(src.strip().encode()).hexdigest() != source_hash:
             logger.warning("No WeLM tile contract for changed kernel %s.%s", module.__name__, name)
             return
-    setattr(module, name, native(tile_layout=layout)(kernel))
+    bound = native(tile_layout=layout)(kernel)
+    if source_hash is not None and layout in (_expert_swiglu_layout, _routing_l1_layout):
+        from .welm_tile_layouts import welm_decode_tiles_active
+
+        bound = _ActiveRowGrid(bound, layout, welm_decode_tiles_active)
+    setattr(module, name, bound)
 
 
 def install_moe_tiles(native):

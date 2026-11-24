@@ -9,7 +9,7 @@ from math import prod
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
 PATH = ROOT / "python/sglang/srt/hardware_backend/npu/graph_runner/welm_moe_tiles.py"
@@ -66,6 +66,24 @@ class MoeTilesTest(unittest.TestCase):
         self.assertIsNone(tiles._expert_swiglu_layout(
             x, groups, out, scale, **(args | {"GROUP_LIST_TYPE": 0})
         ))
+
+    def test_only_supported_small_row_launches_shrink(self):
+        kernel = MagicMock()
+        x = Tensor((40, 256))
+        for active, group_type, expected in ((True, 1, 40), (False, 1, 64), (True, 0, 64)):
+            with self.subTest(active=active, group_type=group_type):
+                expert = tiles._ActiveRowGrid(kernel, tiles._expert_swiglu_layout, lambda: active)
+                expert[(64,)](x, None, None, None, NUM_CORES=64, GROUP_LIST_TYPE=group_type)
+                kernel.__getitem__.assert_called_with((expected,))
+                kernel.__getitem__.return_value.assert_called_with(
+                    x, None, None, None, NUM_CORES=expected, GROUP_LIST_TYPE=group_type
+                )
+        route = tiles._ActiveRowGrid(kernel, tiles._routing_l1_layout, lambda: True)
+        route[(64,)](x, None, 40, 256, 64)
+        kernel.__getitem__.assert_called_with((40,))
+        kernel.__getitem__.return_value.assert_called_with(x, None, 40, 256, 40)
+        route[(16,)](x, None, 40, 256, 16)
+        kernel.__getitem__.assert_called_with((16,))
 
     def test_dp_logits_copy_retains_the_entire_indirect_side(self):
         local, arena = Tensor((3, 128)), Tensor((16, 128))
@@ -127,6 +145,12 @@ class MoeTilesDeviceTest(unittest.TestCase):
         self.torch = torch
 
     def test_expert_rows_match_eager_when_dispatch_counts_change(self):
+        self._check_expert_rows()
+
+    def test_expert_capacity_below_core_count(self):
+        self._check_expert_rows(small=True)
+
+    def _check_expert_rows(self, small=False):
         from megakernel._fixed import capture_fixed
         from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
         from sgl_kernel_npu.norm.l1_norm import l1_norm
@@ -136,7 +160,8 @@ class MoeTilesDeviceTest(unittest.TestCase):
         )
 
         torch = self.torch
-        _, rows = get_device_properties()
+        _, cores = get_device_properties()
+        rows = min(40, cores - 1) if small else cores
         width = 256
         x = torch.empty((rows, width * 2), device="npu", dtype=torch.bfloat16)
         x.fill_(1)

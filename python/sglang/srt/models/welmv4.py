@@ -3217,7 +3217,7 @@ class Qwen2MoeAttention(nn.Module):
                 )
                 if self.k_norm is not None:
                     k_by_head = mmq_style_k_rms_norm(
-                        k_by_head.contiguous(),
+                        k_by_head,
                         self.k_norm.weight,
                         self.k_norm.eps,
                     )

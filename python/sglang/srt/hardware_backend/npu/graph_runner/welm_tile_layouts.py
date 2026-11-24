@@ -36,21 +36,18 @@ def _decode_native(*, tile_layout, **options):
 
 def _k_norm_layout(
     x, gamma, output, tokens, kv_heads, head_dim, x_stride, output_stride,
-    eps, kv_heads_block,
+    eps, kv_heads_block, x_column=0,
 ):
     row = kv_heads * head_dim
-    if (
-        x.shape != (tokens, kv_heads, head_dim)
-        or output.shape != x.shape
-        or gamma.numel() != head_dim
-        or x_stride != row
-        or output_stride != row
-    ):
+    packed = x.shape == (tokens, x_stride) and 0 <= x_column <= x_stride - row
+    dense = x.shape == (tokens, kv_heads, head_dim) and x_stride == row and x_column == 0
+    if (not (packed or dense) or output.shape != (tokens, kv_heads, head_dim)
+            or gamma.numel() != head_dim or output_stride != row):
         return None
     return dict(
         count=tokens,
         block=1,
-        reads=[(x, row * x.element_size())],
+        reads=[(x, x_stride * x.element_size())],
         writes=[(output, row * output.element_size())],
         shared_reads=[gamma],
     )
