@@ -1966,6 +1966,14 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.is_nextn = is_nextn
 
+        self.use_mk_bf16_qkv = (
+            _is_npu
+            and os.environ.get("SGLANG_NPU_WELMV4_MK_BF16_QKV", "0") == "1"
+            and not is_nextn
+            and self.q_norm is None
+            and self.k_norm is not None
+            and (self.q_size, self.kv_size, self.head_dim) == (6144, 512, 256)
+        )
         self.use_npu_fused_qkv = (
             _is_npu
             and os.environ.get("SGLANG_NPU_WELMV4_FUSED_QKV", "0") == "1"
@@ -1974,6 +1982,36 @@ class Qwen2MoeAttention(nn.Module):
             and not is_nextn
             and self.kv_mirror_layer_idx not in self.kv_mirror_layers
         )
+
+    def _project_local_qkv(self, x, batch):
+        # This is the ordinary three-way projection. Fused mirror K/V and
+        # query-only calls have their own column layout and stay with SGLang.
+        if self.use_mk_bf16_qkv and batch.forward_mode.is_decode() and x.shape == (2, 2048):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+                welm_decode_tiles_active,
+            )
+
+            if welm_decode_tiles_active():
+                from megakernel._runtime import _runtime
+                from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+                layer = self.qkv_proj
+                if (type(layer) is QKVParallelLinear
+                        and type(layer.quant_method) is UnquantizedLinearMethod
+                        and not layer.gather_output and layer.bias is None
+                        and not layer._forward_hooks and not layer._forward_pre_hooks
+                        and "forward" not in layer.__dict__
+                        and getattr(_runtime(), "_capture_cube_tile_inputs", False)):
+                    from sglang.srt.hardware_backend.npu.graph_runner.welm_qkv_tiles import (
+                        try_project_qkv,
+                    )
+
+                    projected = try_project_qkv(x, layer.weight)
+                    if projected is not None:
+                        return projected
+
+        packed, _ = self.qkv_proj(x)
+        return packed.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
     def prepare_graph_mirror_key(self, positions, key, batch):
         """Prepare the consumer's K in the T graph; Q belongs to the B graph."""
@@ -3112,15 +3150,13 @@ class Qwen2MoeAttention(nn.Module):
                         self.kv_mirror_layer_idx, (mirror_k, mirror_v)
                     )
             else:
-                qkv, _ = self.qkv_proj(hidden_states)
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k, v = self._project_local_qkv(hidden_states, forward_batch)
         elif self.kv_mirror_layer_idx in self.kv_mirror_layers:
             if (
                 self.kv_mirror_layer_idx in LayerManager.num_nextn_predict_layer_idx
                 and not forward_batch.forward_mode.is_extend_without_speculative()
             ):
-                qkv, _ = self.qkv_proj(hidden_states)
-                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k, v = self._project_local_qkv(hidden_states, forward_batch)
             else:
                 mirror_layer_number = self.kv_mirror_imitated_layers[
                     self.kv_mirror_layers.index(self.kv_mirror_layer_idx)
@@ -3156,9 +3192,9 @@ class Qwen2MoeAttention(nn.Module):
                         else None
                     ),
                 )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             else:
-                qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k, v = self._project_local_qkv(hidden_states, forward_batch)
 
         gate = None
         is_prefill_batch = (
