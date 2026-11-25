@@ -2607,17 +2607,28 @@ def _welmv4_oe_lookup_4way_kernel(ids, w0, w1, w2, w3, output,
     tl.store(output + 3 * WIDTH + cols, tl.load(w3 + i3 + cols))
 
 
-def try_welmv4_oe_lookup_4way_npu(ids, embeddings, vocab_sizes):
+def _welm_plain_embedding_weight(embedding, weight):
+    import torch_npu
+
+    # ACL host mappings are plain ND and have no TorchNPU format descriptor.
+    owner = getattr(embedding, "_host_mapped_npu_allocations", {}).get("weight")
+    if owner is None:
+        owner = getattr(weight, "_host_mapped_npu_allocation", None)
+    if owner is not None:
+        return (owner.registered and not owner.closed and weight.data_ptr() == owner.dev_ptr
+                and weight.numel() * weight.element_size() <= owner.tensor_bytes)
+    return torch_npu.get_npu_format(weight) in (0, 2)
+
+
+def try_welmv4_oe_lookup_4way_npu(ids, embeddings, vocab_sizes, *, model_rows=False):
     """Gather each decode token from four unsharded BF16 OE tables."""
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
-        welm_single_pk_decode_active,
+        welm_model_row_tiles_active, welm_single_pk_decode_active,
     )
 
-    if (not welm_single_pk_decode_active() or ids.ndim != 2
+    if (not (model_rows and welm_model_row_tiles_active() or welm_single_pk_decode_active()) or ids.ndim != 2
             or ids.shape[0] != 4 or ids.shape[1] not in (1, 2, 4, 8)):
         return None
-
-    import torch_npu
 
     from sglang.srt.environ import envs
     from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
@@ -2644,16 +2655,7 @@ def try_welmv4_oe_lookup_4way_npu(ids, embeddings, vocab_sizes):
             or weight.data_ptr() % 32
         ):
             return None
-        # ACL host mappings are plain contiguous ND, constructed with set_ on
-        # external storage. They have no TorchNPU format descriptor to query.
-        owner = getattr(embedding, "_host_mapped_npu_allocations", {}).get("weight")
-        if owner is None:
-            owner = getattr(weight, "_host_mapped_npu_allocation", None)
-        if owner is not None:
-            if (not owner.registered or owner.closed or weight.data_ptr() != owner.dev_ptr
-                    or weight.numel() * weight.element_size() > owner.tensor_bytes):
-                return None
-        elif torch_npu.get_npu_format(weight) not in (0, 2):
+        if not _welm_plain_embedding_weight(embedding, weight):
             return None
         weights.append(weight)
     batch = ids.shape[1]
@@ -2926,10 +2928,13 @@ def sigmoid_mul_kernel_npu(
     y_row_stride: tl.constexpr,
     y_col_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PROGRAM_ROWS: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
-    row_offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    row_mask = row_offset < rows
+    span: tl.constexpr = PROGRAM_ROWS if PROGRAM_ROWS else BLOCK_SIZE
+    lane = tl.arange(0, BLOCK_SIZE)
+    row_offset = pid * span + lane
+    row_mask = (row_offset < rows) & (lane < span)
     col_offset = tl.arange(0, cols)
 
     x_off = row_offset[:, None] * x_row_stride
@@ -2948,14 +2953,17 @@ def inplace_sigmoid_mul_npu(
     BLOCK_SIZE: Optional[int] = None,
 ) -> None:
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
-        take_page_attention_output,
+        take_page_attention_output, welm_model_row_tiles_active,
     )
 
     # One page-merge program writes twelve heads. Three gate programs can
     # consume that region as soon as the merge and the gate values are ready.
     page_output = not torch.compiler.is_compiling() and take_page_attention_output(y)
+    # When O is captured with the page chain, one program consumes the
+    # twelve heads written by each merge, including the eight-token bucket.
+    rows_per_program = 12 if page_output and BLOCK_SIZE is None and welm_model_row_tiles_active() else 0
     if BLOCK_SIZE is None:
-        BLOCK_SIZE = 4 if page_output else 128
+        BLOCK_SIZE = 16 if rows_per_program else 4 if page_output else 128
     cols = y.shape[-1]
     rows = y.numel() // cols
 
@@ -2966,7 +2974,7 @@ def inplace_sigmoid_mul_npu(
     x_flattened = x.view(rows, -1)
     y_flattened = y.view(rows, -1)
 
-    grid = (triton.cdiv(rows, BLOCK_SIZE),)
+    grid = (triton.cdiv(rows, rows_per_program or BLOCK_SIZE),)
     sigmoid_mul_kernel_npu[grid](
         x_flattened,
         y_flattened,
@@ -2975,5 +2983,5 @@ def inplace_sigmoid_mul_npu(
         x_flattened.stride(0),
         y_flattened.stride(0),
         y_flattened.stride(1),
-        BLOCK_SIZE=BLOCK_SIZE
+        BLOCK_SIZE=BLOCK_SIZE, PROGRAM_ROWS=rows_per_program
     )

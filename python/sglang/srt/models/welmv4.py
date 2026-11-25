@@ -107,6 +107,7 @@ if is_npu():
     import torch_npu
 
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        welm_model_row_tiles_active,
         welm_page_gate_tiles_active,
         welm_single_pk_decode_active,
     )
@@ -1017,6 +1018,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.is_kv_mirror_consumer = self.layer_id in set(
             getattr(config, "kv_mirror_layers", []) or []
         )
+        self.use_mk_ffn_tiles = (
+            _is_npu and quant_config is None and not is_nextn and self.tp_size == 1
+            and get_bool_env_var("SGLANG_NPU_WELMV4_MK_FFN_TILES")
+        )
         self.experts.welm_moe_use_nd = envs.WELM_NPU_MOE_USE_ND.get()
         # MegaMoE also needs the canonical logical layout for MXFP8.
         self.experts.welm_megamoe_keep_nd = (
@@ -1163,6 +1168,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         fuse_shared_this_call = shared_kwargs is not None
         moe_a2a_backend = get_moe_a2a_backend()
+        tiled_ffn = False
+        if (self.use_mk_ffn_tiles and moe_a2a_backend.is_none() and forward_batch is not None
+                and forward_batch.forward_mode.is_decode() and not torch.compiler.is_compiling()
+                and not envs.SGLANG_NPU_USE_MULTI_STREAM.get()):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import welm_decode_tiles_active
+
+            tiled_ffn = welm_decode_tiles_active()
         is_prefill_batch = (
             forward_batch is not None
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
@@ -1316,14 +1328,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 and not enable_npu_shared_alt_stream
                 and not enable_npu_megamoe_shared_gate_up_overlap
             ):
-                shared_output = self._forward_shared_expert(hidden_states)
+                if tiled_ffn and self.shared_expert_gate is None:
+                    from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import try_shared_expert
+
+                    shared_output = try_shared_expert(hidden_states, self.shared_expert)
+                if shared_output is None:
+                    shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
                 router_weight = self.get_npu_router_compute_weight_t()
                 router_logits = None
-                if (
-                    self.tp_size == 1
-                    and welm_single_pk_decode_active()
-                ):
+                tiled_router = False
+                if tiled_ffn:
+                    from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import plain_router
+
+                    tiled_router = plain_router(self.gate)
+                if self.tp_size == 1 and (welm_single_pk_decode_active() or tiled_router):
                     from sglang.srt.hardware_backend.npu.graph_runner.welm_narrow_projection import (
                         narrow_projection,
                     )
@@ -1472,7 +1491,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 else moe_expert_parallel_all_reduce(experts_output)
             )
         else:
-            experts_output = self.experts(hidden_states, topk_output)
+            experts_output = None
+            if tiled_ffn:
+                from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import try_routed_expert
+
+                experts_output = try_routed_expert(hidden_states, topk_output, self.experts)
+            if experts_output is None:
+                experts_output = self.experts(hidden_states, topk_output)
         if return_components and skip_component_output:
             if enable_npu_shared_alt_stream:
                 # This early return hands shared_output to the caller, so it is
@@ -2004,14 +2029,16 @@ class Qwen2MoeAttention(nn.Module):
         layer = self.gate_proj
         if (
             _is_npu
-            and welm_single_pk_decode_active()
+            and (welm_single_pk_decode_active() or self.supports_mk_page_gate and welm_model_row_tiles_active())
             and type(layer) is ColumnParallelLinear
             and layer.tp_size == 1
             and not layer.gather_output
             and layer.quant_config is None
             and layer.bias is None
             and not layer._forward_pre_hooks
-            and not layer._forward_hooks
+            and not layer._forward_hooks and "forward" not in layer.__dict__
+            and not torch.nn.modules.module._global_forward_hooks
+            and not torch.nn.modules.module._global_forward_pre_hooks
         ):
             from sglang.srt.hardware_backend.npu.graph_runner.welm_narrow_projection import (
                 narrow_projection,
@@ -2021,6 +2048,18 @@ class Qwen2MoeAttention(nn.Module):
             if gate is not None:
                 return gate.unsqueeze(-1)
         return layer(hidden_states)[0].unsqueeze(-1)
+
+    def _project_mirror_weight(self, hidden_states, batch):
+        weight, bias = self.qkv_proj_weight, self.qkv_proj_bias
+        if (self.supports_mk_page_gate and bias is None and batch.forward_mode.is_decode()
+                and batch.spec_info is None and not torch.compiler.is_compiling()
+                and welm_model_row_tiles_active()):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_row_projection import try_row_projection
+
+            projected = try_row_projection(hidden_states, weight)
+            if projected is not None:
+                return projected
+        return F.linear(hidden_states, weight, bias)
 
     def _project_local_qkv(self, x, batch):
         # This is the ordinary three-way projection. Fused mirror K/V and
@@ -3180,7 +3219,7 @@ class Qwen2MoeAttention(nn.Module):
                         self.kv_mirror_layer_idx, (mirror_k, mirror_v)
                     )
             elif hasattr(self, "qkv_proj_weight"):
-                qkv = F.linear(hidden_states, self.qkv_proj_weight, self.qkv_proj_bias)
+                qkv = self._project_mirror_weight(hidden_states, forward_batch)
                 q, k, v, mirror_k, mirror_v = qkv.split(
                     [
                         self.q_size,
@@ -3227,9 +3266,7 @@ class Qwen2MoeAttention(nn.Module):
                 elif getattr(self, "_kv_mirror_mxfp8_query_projection", False):
                     q, _ = self.qkv_proj(hidden_states)
                 else:
-                    q = F.linear(
-                        hidden_states, self.qkv_proj_weight, self.qkv_proj_bias
-                    )
+                    q = self._project_mirror_weight(hidden_states, forward_batch)
         else:
             if reuse_prefill_mxfp8_input:
                 (
@@ -3464,10 +3501,19 @@ class Qwen2MoeAttention(nn.Module):
                 attn_output, group=o_proj_rs_group
             )
         else:
-            output, _ = self.o_proj(
-                attn_output,
-                skip_all_reduce=skip_o_proj_all_reduce,
-            )
+            output = None
+            if (self.supports_mk_page_gate and forward_batch.forward_mode.is_decode()
+                    and forward_batch.spec_info is None and not torch.compiler.is_compiling()
+                    and welm_model_row_tiles_active()):
+                from sglang.srt.hardware_backend.npu.graph_runner.welm_row_projection import (
+                    plain_linear, try_row_projection,
+                )
+
+                if (plain_linear(self.o_proj, RowParallelLinear) and self.o_proj.tp_size == 1
+                        and not self.o_proj.use_decode_attn_tp):
+                    output = try_row_projection(attn_output, self.o_proj.weight)
+            if output is None:
+                output, _ = self.o_proj(attn_output, skip_all_reduce=skip_o_proj_all_reduce)
         if self.o_norm is not None and not skip_o_norm:
             output, _ = self.o_norm(output)
         return output
@@ -4537,6 +4583,7 @@ class Qwen2MoeModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.supports_mk_model_rows = _is_npu and quant_config is None and type(self) is Qwen2MoeModel
         # Some WeLMv4 remote configs do not define pad_token_id.  Padding is
         # handled by SGLang's request metadata, so keep this optional just as
         # the mainline Qwen2 implementation does.
@@ -4995,9 +5042,12 @@ class Qwen2MoeModel(nn.Module):
         num_tokens = input_ids.numel()
 
         emb_ngram_concat = None
+        model_rows = (_is_npu and getattr(self, "supports_mk_model_rows", False) and prepared_ids is None
+                      and forward_batch.forward_mode.is_decode() and forward_batch.spec_info is None
+                      and not torch.compiler.is_compiling() and welm_model_row_tiles_active())
         if _is_npu and prepared_ids is None and forward_batch.forward_mode.is_decode():
             emb_ngram_concat = try_welmv4_oe_lookup_4way_npu(
-                hashed_ids, oe_embed_modules, self.oe_vocab_sizes
+                hashed_ids, oe_embed_modules, self.oe_vocab_sizes, model_rows=model_rows
             )
         if emb_ngram_concat is None:
             emb_ngram = []
@@ -5017,8 +5067,18 @@ class Qwen2MoeModel(nn.Module):
                 )
             else:
                 emb_ngram_concat = torch.cat(emb_ngram, dim=-1)
-        emb_new, _ = oe_up_proj_module(emb_ngram_concat)
-        hidden_states = (base_hidden_states[:history_num_tokens] + emb_new) / 2.0
+        base = base_hidden_states[:history_num_tokens]
+        hidden_states = None
+        if model_rows:
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_row_projection import (
+                plain_linear, try_oe_embedding,
+            )
+
+            if plain_linear(oe_up_proj_module, ReplicatedLinear):
+                hidden_states = try_oe_embedding(base, emb_ngram_concat, oe_up_proj_module.weight)
+        if hidden_states is None:
+            emb_new, _ = oe_up_proj_module(emb_ngram_concat)
+            hidden_states = (base + emb_new) / 2.0
         if history_num_tokens < num_tokens:
             hidden_states = torch.cat(
                 (hidden_states, base_hidden_states[history_num_tokens:]), dim=0
@@ -5190,7 +5250,14 @@ class Qwen2MoeModel(nn.Module):
             hidden_states, residual, positions = graph.begin_mirror(forward_batch)
         elif self.pp_group.is_first_rank:
             if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+                hidden_states = None
+                if (self.supports_mk_model_rows and forward_batch.forward_mode.is_decode() and forward_batch.spec_info is None
+                        and not torch.compiler.is_compiling() and welm_model_row_tiles_active()):
+                    from sglang.srt.hardware_backend.npu.graph_runner.welm_row_projection import try_base_embedding
+
+                    hidden_states = try_base_embedding(input_ids, self.embed_tokens)
+                if hidden_states is None:
+                    hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
 
@@ -5305,20 +5372,22 @@ class Qwen2MoeModel(nn.Module):
                         hidden_states = final_experts_output.float() + residual.float()
                         if final_shared_output is not None:
                             hidden_states = hidden_states + final_shared_output.float()
-                        pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
-                        hidden_states = F.rms_norm(
-                            pre_norm_hidden_states,
-                            self.norm.weight.shape,
-                            self.norm.weight,
-                            eps=self.norm.eps,
-                        )
                     else:
                         hidden_states = hidden_states.float() + residual.float()
-                        pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
+                    pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
+                    if (getattr(self, "_mk_lm_head_tiles", False)
+                            and forward_batch.forward_mode.is_decode()
+                            and not torch.compiler.is_compiling()):
+                        from sglang.srt.hardware_backend.npu.graph_runner.welm_lm_head import (
+                            try_welm_final_norm,
+                        )
+
+                        hidden_states = try_welm_final_norm(self.norm, pre_norm_hidden_states)
+                    else:
+                        hidden_states = None
+                    if hidden_states is None:
                         hidden_states = F.rms_norm(
-                            pre_norm_hidden_states,
-                            self.norm.weight.shape,
-                            self.norm.weight,
+                            pre_norm_hidden_states, self.norm.weight.shape, self.norm.weight,
                             eps=self.norm.eps,
                         )
 
@@ -5384,7 +5453,19 @@ class WeLMV4MoeForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config)
+        if (_is_npu and quant_config is None and get_bool_env_var("SGLANG_NPU_WELMV4_MK_LM_HEAD_TILES")
+                and get_global_server_args().model_execution_backend == "megakernel-native"
+                and not get_global_server_args().enable_lora
+                and (config.vocab_size, config.hidden_size) == (155648, 2048)
+                and self.lm_head.tp_size in (1, 4, 8)):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_lm_head import (
+                WelmDecodeLogitsProcessor,
+            )
+
+            self.logits_processor = WelmDecodeLogitsProcessor(config)
+            self.model._mk_lm_head_tiles = self.logits_processor.supports_welm_head_tiles()
+        else:
+            self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 

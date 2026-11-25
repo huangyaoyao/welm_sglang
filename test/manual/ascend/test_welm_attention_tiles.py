@@ -102,6 +102,9 @@ class WelmAttentionTilesTest(unittest.TestCase):
         self.assertEqual((layout["count"], layout["block"]), (192, 128))
         self.assertEqual(layout["reads"], [(gates, 4), (values, 512)])
         self.assertEqual(layout["writes"], [(values, 512)])
+        matched = sigmoid(gates, values, rows, cols, 1, cols, 1, BLOCK_SIZE=16, PROGRAM_ROWS=12)
+        self.assertEqual((matched["count"], matched["block"]), (192, 12))
+        self.assertIsNone(sigmoid(gates, values, rows, cols, 1, cols, 1, BLOCK_SIZE=8, PROGRAM_ROWS=12))
         self.assertIsNone(sigmoid(gates, values, rows, cols, 2, cols, 1, BLOCK_SIZE=128))
 
     def test_large_verify_selects_token_blocks_with_masked_tail(self):
@@ -126,7 +129,7 @@ class WelmAttentionTilesTest(unittest.TestCase):
                 args = source[name].args.args
                 # Source launches pass BLOCK_SIZE by keyword on the sigmoid path.
                 if name == "sigmoid_mul_kernel_npu":
-                    signature(callback).bind(*[None] * (len(args) - 1), BLOCK_SIZE=128)
+                    signature(callback).bind(*[None] * (len(args) - 2), BLOCK_SIZE=16, PROGRAM_ROWS=12)
                 else:
                     signature(callback).bind(*[None] * len(args))
 

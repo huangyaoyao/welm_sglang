@@ -19,6 +19,11 @@ def tensor(shape, width=4):
 
 
 class OeTileTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(sys.modules, {
+            "sglang.srt.utils": SimpleNamespace(get_bool_env_var=lambda _: False),
+        }))
+
     def test_single_pk_policy_is_local_to_explicit_decode_scope(self):
         active = bindings["welm_single_pk_decode_active"]
         scope = bindings["decode_tile_scope"]

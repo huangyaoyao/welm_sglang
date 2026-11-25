@@ -70,15 +70,17 @@ def _post_attention_norm(x, residual, onorm_weight, rnorm_weight, out, out_resid
     return _norm_rows(rows, cols, 1, (x, residual), outputs, (onorm_weight, rnorm_weight))
 
 
-def _sigmoid_gate(x, y, rows, cols, x_row_stride, y_row_stride, y_col_stride, BLOCK_SIZE):
+def _sigmoid_gate(x, y, rows, cols, x_row_stride, y_row_stride, y_col_stride, BLOCK_SIZE, PROGRAM_ROWS=0):
     # A logical row is one (token, head) pair. One program owns BLOCK_SIZE
     # such rows, even when a program boundary falls inside a token.
     if (min(rows, cols, BLOCK_SIZE) <= 0 or x.shape != (rows, 1)
             or y.shape != (rows, cols) or x_row_stride != 1
             or y_row_stride != cols or y_col_stride != 1):
         return None
+    if PROGRAM_ROWS and not 0 < PROGRAM_ROWS <= BLOCK_SIZE:
+        return None
     values = (y, cols * y.element_size())
-    return dict(count=rows, block=BLOCK_SIZE, reads=[(x, x.element_size()), values],
+    return dict(count=rows, block=PROGRAM_ROWS or BLOCK_SIZE, reads=[(x, x.element_size()), values],
                 writes=[values])
 
 

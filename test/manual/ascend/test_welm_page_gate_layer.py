@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 
 GATE_FLAG = "SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES"
+LEGACY_FUSE_GATE_FLAG = "SGLANG_NPU_WELMV4_MK_FUSE_PAGE_GATE"
 
 
 class WelmPageGateLayerTest(unittest.TestCase):
@@ -29,6 +30,7 @@ class WelmPageGateLayerTest(unittest.TestCase):
             "WELM_NPU_USE_FLASH_ATTN": "1",
             "SGLANG_NPU_WELMV4_MK_PAGE_ATTENTION": "1",
             GATE_FLAG: "1",
+            LEGACY_FUSE_GATE_FLAG: "0",
             "SGLANG_NPU_WELMV4_MK_BF16_QKV": "1",
             "SGLANG_NPU_WELMV4_FUSED_QKV": "0",
             "SGLANG_NPU_USE_MULTI_STREAM": "0",
@@ -107,20 +109,27 @@ class WelmPageGateLayerTest(unittest.TestCase):
                 param.copy_(self._random(param.shape))
         return layer
 
-    def _check_graph(self, plan):
+    def _check_graph(self, plan, replace_attention):
         nodes = {}
         for scope_id, scope in enumerate(plan.plans):
             for node, name in enumerate(scope.kernel_names):
                 nodes.setdefault(name, []).append((scope_id, node))
         (merge_scope, merge), = nodes["_merge_page_attention"]
+        if replace_attention:
+            # The hook returns a new tensor. That tensor must receive its own
+            # sigmoid multiply after the hook, with ordinary dependency analysis.
+            self.assertEqual(len(nodes.get("sigmoid_mul_kernel_npu", [])), 1)
+            return
         (gate_scope, gate), = nodes["sigmoid_mul_kernel_npu"]
         self.assertEqual(merge_scope, gate_scope, nodes)
         scope = plan.plans[gate_scope]
         self.assertIn(merge, scope.dependencies[gate])
-        self.assertIn((merge, gate), scope.tile_dependencies)
-        self.assertEqual(scope.tile_dependency_ratios[(merge, gate)], (1, 3))
+        edge = (merge, gate)
+        fine = os.environ["MK_NATIVE_TILE_DEPENDENCIES"] != "0"
+        self.assertEqual(edge in scope.tile_dependencies, fine)
+        self.assertEqual(scope.tile_dependency_ratios.get(edge), (1, 3) if fine else None)
 
-    def _check_layer(self, batch_size, window):
+    def _check_layer(self, batch_size, window, replace_attention=False):
         from megakernel._fixed import capture_fixed
         from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
         from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
@@ -132,6 +141,15 @@ class WelmPageGateLayerTest(unittest.TestCase):
         torch = self.torch
         install_welm_tile_layouts()
         layer = self._layer(window)
+        if replace_attention:
+            # The small random layer otherwise produces sigmoid values close to
+            # 0.5. Exercise changes in the input gate on every replay.
+            layer.gate_proj.weight.mul_(128)
+        if replace_attention:
+            # Adding a bias before the gate differs from adding it after the
+            # gate. Compare against the same hook running on unfused eager PAGE.
+            hook = layer.attn.register_forward_hook(lambda module, args, output: output + 1)
+            self.addCleanup(hook.remove)
         columns = 9 if window == 511 else 3
         pages = 1 + columns * batch_size
         pool = self._pool(pages)
@@ -181,28 +199,36 @@ class WelmPageGateLayerTest(unittest.TestCase):
         def forward():
             return layer(positions, hidden, batch)
 
-        with forward_context(ForwardContext(backend)), decode_tile_scope(single_pk=False), tempfile.TemporaryDirectory() as build:
+        # WelmNativeBackend.capture_one uses single-PK and retains the
+        # traced tensor owners for these four single-device coarse buckets.
+        single_pk = os.environ["MK_NATIVE_TILE_DEPENDENCIES"] == "0"
+        with forward_context(ForwardContext(backend)), decode_tile_scope(single_pk=single_pk), tempfile.TemporaryDirectory() as build:
             set_inputs(0)
-            # Check where ordinary ColumnParallelLinear executes in the actual layer.
-            # Remove observers before capture so the real kernels are recorded without instrumentation.
-            order = []
-            with layer.gate_proj.register_forward_pre_hook(lambda *_: order.append("gate")), \
-                    layer.attn.register_forward_pre_hook(lambda *_: order.append("attention")):
+            # Keep the hook-output case free of additional observers.
+            if replace_attention:
                 forward()
-            self.assertEqual(order, ["gate", "attention"])
-            plan = capture_fixed(forward, build, tile_chains=True)
+            else:
+                order = []
+                with layer.gate_proj.register_forward_pre_hook(lambda *_: order.append("gate")), \
+                        layer.attn.register_forward_pre_hook(lambda *_: order.append("attention")):
+                    forward()
+                self.assertEqual(order, ["gate", "attention"])
+            plan = capture_fixed(forward, build, tile_chains=True, retain_intermediates=single_pk)
             try:
-                self._check_graph(plan)
+                self._check_graph(plan, replace_attention)
                 for step in range(2):
                     set_inputs(step)
                     # The original order computes the gate after attention and uses the ordinary gate grid.
-                    with patch.dict(os.environ, {GATE_FLAG: "0"}), decode_tile_scope(single_pk=False):
+                    with patch.dict(os.environ, {GATE_FLAG: "0", LEGACY_FUSE_GATE_FLAG: "0"}), decode_tile_scope(single_pk=False):
                         expected = forward().cpu()
                     expected_cache = [tensor.cpu() for tensor in cache]
                     for view, seed in zip(cache, seeds):
                         view.copy_(seed)
                     actual = plan.replay().cpu()
                     torch.testing.assert_close(actual.float(), expected.float(), atol=1 / 128, rtol=1 / 64)
+                    if replace_attention:
+                        relative_rms = (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(1e-12)
+                        self.assertLessEqual(float(relative_rms), 0.02)
                     for view, oracle in zip(cache, expected_cache):
                         self.assertTrue(torch.equal(view.cpu(), oracle))
                     for first in (pool.get_key_buffer(0), pool.get_value_buffer(0)):
@@ -214,6 +240,15 @@ class WelmPageGateLayerTest(unittest.TestCase):
         for size, window in [(1, -1), (2, -1), (4, -1), (8, -1), (2, 511)]:
             with self.subTest(batch=size, window=window):
                 self._check_layer(size, window)
+
+    @patch.dict(os.environ, {LEGACY_FUSE_GATE_FLAG: "1"})
+    def test_legacy_fusion_flag_keeps_singleton_coarse_gate(self):
+        with patch.dict(os.environ, MK_NATIVE_TILE_DEPENDENCIES="0"):
+            self._check_layer(2, 511)
+
+    @patch.dict(os.environ, {LEGACY_FUSE_GATE_FLAG: "1"})
+    def test_attention_output_hook_preserves_unfused_gate(self):
+        self._check_layer(2, -1, replace_attention=True)
 
 
 if __name__ == "__main__":

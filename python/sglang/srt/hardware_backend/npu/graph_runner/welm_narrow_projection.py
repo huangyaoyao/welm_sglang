@@ -5,10 +5,19 @@ import triton
 import triton.language as tl
 from megakernel.triton import native
 
-from .welm_tile_layouts import welm_single_pk_decode_active
+from .welm_tile_layouts import welm_model_row_tiles_active, welm_single_pk_decode_active
 
 
-@native(core="cube", enabled=welm_single_pk_decode_active)
+def _narrow_projection_active(*, router=True):
+    if welm_single_pk_decode_active() or welm_model_row_tiles_active():
+        return True
+    from .welm_tile_layouts import welm_decode_tiles_active
+    from sglang.srt.utils import get_bool_env_var
+
+    return router and welm_decode_tiles_active() and get_bool_env_var("SGLANG_NPU_WELMV4_MK_FFN_TILES")
+
+
+@native(core="cube", enabled=_narrow_projection_active)
 @triton.jit
 def _welm_narrow_projection_kernel(
     x, weight, output, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, KN: tl.constexpr,
@@ -44,7 +53,7 @@ def narrow_projection(x, weight, *, router):
     The gate stores [N,K] weights and returns BF16. The router takes [K,N]
     weights (including a transpose view) and returns unrounded FP32 logits.
     """
-    if (not welm_single_pk_decode_active() or x.device.type != "npu"
+    if (not _narrow_projection_active(router=router) or x.device.type != "npu"
             or weight.device != x.device or x.ndim != 2 or x.shape[1] != 2048
             or x.shape[0] not in (1, 2, 4, 8)
             or x.dtype != torch.bfloat16 or weight.dtype != x.dtype

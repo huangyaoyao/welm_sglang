@@ -12,6 +12,8 @@ def decode_tile_scope(*, single_pk=False):
     from sglang.srt.utils import get_bool_env_var
 
     workspace = {"single_pk": True} if single_pk else {}
+    if get_bool_env_var("SGLANG_NPU_WELMV4_MK_MODEL_ROW_TILES"):
+        workspace["model_row_tiles"] = True
     if get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES"):
         workspace["page_attention_output"] = None
     token = _decode_active.set(workspace)
@@ -33,6 +35,11 @@ def welm_single_pk_decode_active():
 def welm_decode_tile_workspace():
     """Scratch shared by layers of this capture, isolated from other plans."""
     return _decode_active.get()
+
+
+def welm_model_row_tiles_active():
+    workspace = _decode_active.get()
+    return workspace is not None and workspace.get("model_row_tiles", False)
 
 
 def welm_page_gate_tiles_active():
