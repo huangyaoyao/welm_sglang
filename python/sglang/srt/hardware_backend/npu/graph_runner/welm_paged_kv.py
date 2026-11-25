@@ -56,8 +56,8 @@ def _read_flash_pages(keys, values, table, lengths, flash_k, flash_v,
                     tl.store(flash_v + addr, tl.load(values + addr))
 
 
-def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace):
-    """Return paged Flash operands, or None before modifying any cache."""
+def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace, *, copy_pages=True):
+    """Write KV and return the staged or persistent Flash operands when supported."""
     import torch_npu
 
     if not welm_decode_tiles_active() or slots is None or table is None or lengths is None:
@@ -85,13 +85,16 @@ def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace):
     pages = keys.shape[0]
     group = triton.cdiv(pages, 16)
     grid = (triton.cdiv(pages, group),)
-    # The graph bucket owns this scratch. Equal geometries reuse it across
-    # layers; Flash consumes it before the next layer can overwrite it.
-    cache_key = (device, pages)
-    if cache_key not in workspace:
-        workspace[cache_key] = (torch.zeros_like(keys), torch.zeros_like(values))
-    flash_k, flash_v = workspace[cache_key]
+    if copy_pages:
+        # The graph bucket owns this scratch. Equal geometries reuse it across
+        # layers; Flash consumes it before the next layer can overwrite it.
+        cache_key = (device, pages)
+        if cache_key not in workspace:
+            workspace[cache_key] = (torch.zeros_like(keys), torch.zeros_like(values))
+        flash_k, flash_v = workspace[cache_key]
     _write_kv_pages[grid](k, v, slots, keys, values, k.stride(0), v.stride(0), pages, group, rows)
+    if not copy_pages:
+        return keys, values
     columns = table.shape[1]
     _read_flash_pages[grid](keys, values, table, lengths, flash_k, flash_v,
                             pages, group, columns, rows)
