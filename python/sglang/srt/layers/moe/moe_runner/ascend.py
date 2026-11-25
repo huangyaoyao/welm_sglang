@@ -140,6 +140,12 @@ class AscendRunnerCore(MoeRunnerCore):
         """
         Execute the MoE layer using NPU‑specific grouped matmul ops.
         """
+        if getattr(self.config.layer, "welm_local_ffn_tiles", False) and hooks is None:
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_local_ep_ffn import try_sorted_experts
+
+            tiled = try_sorted_experts(runner_input, quant_info, self.config.layer)
+            if tiled is not None:
+                return AscendRunnerOutput(hidden_states=tiled)
         x = runner_input.hidden_states
         original_dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
         expert_tokens = runner_input.expert_tokens

@@ -1019,8 +1019,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             getattr(config, "kv_mirror_layers", []) or []
         )
         self.use_mk_ffn_tiles = (
-            _is_npu and quant_config is None and not is_nextn and self.tp_size == 1
+            _is_npu and quant_config is None and not is_nextn
             and get_bool_env_var("SGLANG_NPU_WELMV4_MK_FFN_TILES")
+        )
+        self.experts.welm_local_ffn_tiles = (
+            self.use_mk_ffn_tiles and self.tp_size in (4, 8) and self.experts.moe_ep_size == self.tp_size
+            and self.experts.moe_tp_size == 1 and get_parallel().attn_tp_size == 1
+            and get_parallel().attn_dp_size == self.tp_size
         )
         self.experts.welm_moe_use_nd = envs.WELM_NPU_MOE_USE_ND.get()
         # MegaMoE also needs the canonical logical layout for MXFP8.
@@ -1050,6 +1055,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
             )
         return shared_output
+
+    def _forward_tiled_shared_expert(self, hidden_states):
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import try_shared_expert
+
+        if self.shared_expert_gate is None:
+            output = try_shared_expert(hidden_states, self.shared_expert)
+            if output is not None:
+                return output
+        return self._forward_shared_expert(hidden_states)
 
     def get_npu_router_compute_weight(
         self, dtype: torch.dtype
@@ -1168,10 +1182,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         fuse_shared_this_call = shared_kwargs is not None
         moe_a2a_backend = get_moe_a2a_backend()
+        tiled_ep = (getattr(self.experts, "welm_local_ffn_tiles", False)
+                     and (moe_a2a_backend.is_deepep() or moe_a2a_backend.is_ascend_fuseep()))
         tiled_ffn = False
-        if (self.use_mk_ffn_tiles and moe_a2a_backend.is_none() and forward_batch is not None
+        if (self.use_mk_ffn_tiles and ((self.tp_size == 1 and moe_a2a_backend.is_none()) or tiled_ep)
+                and forward_batch is not None
                 and forward_batch.forward_mode.is_decode() and not torch.compiler.is_compiling()
-                and not envs.SGLANG_NPU_USE_MULTI_STREAM.get()):
+                and (tiled_ep or not envs.SGLANG_NPU_USE_MULTI_STREAM.get())):
             from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import welm_decode_tiles_active
 
             tiled_ffn = welm_decode_tiles_active()
@@ -1328,12 +1345,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 and not enable_npu_shared_alt_stream
                 and not enable_npu_megamoe_shared_gate_up_overlap
             ):
-                if tiled_ffn and self.shared_expert_gate is None:
-                    from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import try_shared_expert
-
-                    shared_output = try_shared_expert(hidden_states, self.shared_expert)
-                if shared_output is None:
-                    shared_output = self._forward_shared_expert(hidden_states)
+                shared_output = (self._forward_tiled_shared_expert(hidden_states) if tiled_ffn
+                                 else self._forward_shared_expert(hidden_states))
             if _is_npu:
                 router_weight = self.get_npu_router_compute_weight_t()
                 router_logits = None
@@ -1342,7 +1355,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import plain_router
 
                     tiled_router = plain_router(self.gate)
-                if self.tp_size == 1 and (welm_single_pk_decode_active() or tiled_router):
+                if (self.tp_size == 1 and welm_single_pk_decode_active()) or tiled_router:
                     from sglang.srt.hardware_backend.npu.graph_runner.welm_narrow_projection import (
                         narrow_projection,
                     )
@@ -1359,7 +1372,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 # routing, dispatch, and the routed-expert path until final add;
                 # both paths only read the original hidden_states storage.
                 shared_output = process_shared_expert(
-                    hidden_states, self._forward_shared_expert
+                    hidden_states,
+                    self._forward_tiled_shared_expert if tiled_ffn else self._forward_shared_expert,
                 )
             if enable_npu_megamoe_shared_gate_up_overlap:
                 # The helper makes the shared stream wait for the router GEMM
@@ -1479,9 +1493,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     "WeLMv4 local EP MoE requires a FULL replicated token "
                     "layout, but use_reduce_scatter is enabled."
                 )
-            experts_output = self.experts.forward_local_ep_partial(
-                hidden_states, topk_output
-            )
+            if tiled_ffn and tiled_ep:
+                from sglang.srt.hardware_backend.npu.graph_runner.welm_local_ep_ffn import run_with_local_ffn
+
+                experts_output = run_with_local_ffn(
+                    self.experts.forward_local_ep_partial, hidden_states, topk_output
+                )
+            else:
+                experts_output = self.experts.forward_local_ep_partial(hidden_states, topk_output)
             # Only routed experts are partial across EP ranks. The shared
             # expert below is fully replicated under DeepEP and must be added
             # after this sum, otherwise it would be multiplied by EP size.
@@ -1492,7 +1511,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             experts_output = None
-            if tiled_ffn:
+            if tiled_ffn and tiled_ep and moe_a2a_backend.is_deepep():
+                from sglang.srt.hardware_backend.npu.graph_runner.welm_local_ep_ffn import run_with_local_ffn
+
+                experts_output = run_with_local_ffn(self.experts, hidden_states, topk_output)
+            elif tiled_ffn and not tiled_ep:
                 from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import try_routed_expert
 
                 experts_output = try_routed_expert(hidden_states, topk_output, self.experts)
