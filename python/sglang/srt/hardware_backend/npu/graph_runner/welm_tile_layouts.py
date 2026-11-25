@@ -79,11 +79,22 @@ def _rope_layout(
 
 @lru_cache(maxsize=1)
 def install_welm_tile_layouts():
-    """Bind A5 implicit-program-ID children once in the opted-in worker."""
+    """Register Triton children once in the WeLM native worker."""
+    import torch
+
     from sglang.srt.layers import welmv4_npu_op, welmv4_op
     from .welm_attention_tiles import install_attention_tiles
     from .welm_oe_tiles import install_oe_tiles
 
+    if torch.npu.get_device_name().startswith("Ascend950"):
+        from megakernel.triton import native
+        from sglang.srt.hardware_backend.npu.attention import sink_full_attention
+
+        sink_full_attention.paged_decode_kernel = native(
+            child=sink_full_attention._paged_decode_child,
+            core="mix",
+            enabled=welm_decode_tiles_active,
+        )(sink_full_attention.paged_decode_kernel)
     install_attention_tiles(_decode_native)
     install_oe_tiles(_decode_native)
 

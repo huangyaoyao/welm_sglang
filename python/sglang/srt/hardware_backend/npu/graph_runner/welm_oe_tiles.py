@@ -45,12 +45,24 @@ def _verify_hash(ids, table, requests, offsets, lengths, starts, output, tokens,
                 writes=[], shared_reads=[ids, table], whole_writes=[output])
 
 
+def _concat_rows(x0, x1, x2, x3, output, *, WIDTH):
+    # The caller has checked all four dense inputs. One program copies a full row.
+    row_bytes = WIDTH * output.element_size()
+    return dict(
+        count=output.shape[0],
+        block=1,
+        reads=[(x, row_bytes) for x in (x0, x1, x2, x3)],
+        writes=[(output, 4 * row_bytes)],
+    )
+
+
 def install_oe_tiles(native):
     from sglang.srt.layers import welmv4_npu_op as kernels
 
     # The last original JIT is shared with prefill. The runner activates
     # this binding solely while preparing fixed decode/verification buckets.
     for name, layout in (
+        ("_welmv4_oe_concat_4way_kernel", _concat_rows),
         ("_welmv4_oe_hash_decode_4way_kernel", _decode_hash),
         ("_welmv4_oe_hash_explicit_history_4way_kernel", _draft_hash),
         ("_welmv4_oe_hash_prefill_4way_kernel", _verify_hash),

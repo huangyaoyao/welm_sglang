@@ -1478,15 +1478,17 @@ def mirror_paged_decode_fd_reduce_kernel(
         )
 
 
-# See paged_decode_fd_kernel: only the graph/eager block-table representation
-# is request-dependent.  BATCH_SIZE and all data layouts remain specialized.
+# The global entry and MK's paired Cube/Vector child share this math.
+# Each logical tile processes the same grid-stride sequence of KV heads.
 @triton.jit(
     do_not_specialize=[
         "block_tables_ptr",
         "stride_bt_batch",
+        "tile_id",
+        "tile_count",
     ]
 )
-def paged_decode_kernel(
+def _paged_decode_child(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -1521,16 +1523,16 @@ def paged_decode_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     SINK_ENABLED: tl.constexpr,
+    tile_id,
+    tile_count,
 ):
     GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
     tl.static_assert(HEAD_DIM <= BLOCK_SIZE_D, "HEAD_DIM should be less than BLOCK_SIZE_D")
     tl.static_assert(PAGE_SIZE % BLOCK_SIZE_N == 0, "BLOCK_SIZE_N must be a divisor of PAGE_SIZE")
-    pid = tl.program_id(0)
-    n_progs = tl.num_programs(0)
 
     num_tasks = BATCH_SIZE * NUM_KV_HEADS
 
-    for kv_task_id in range(pid, num_tasks, n_progs):
+    for kv_task_id in range(tile_id, num_tasks, tile_count):
         kv_head_id = kv_task_id % NUM_KV_HEADS
         b_id = kv_task_id // NUM_KV_HEADS
 
@@ -1628,6 +1630,62 @@ def paged_decode_kernel(
         # Store output for all heads in the group
         o_ptrs = o_ptr + b_id * stride_ob + q_head_ids[:, None] * stride_oh + offs_d[None, :] * stride_od
         tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=offs_d[None, :] < HEAD_DIM)
+
+
+# See paged_decode_fd_kernel: only the graph/eager block-table representation
+# is request-dependent.  BATCH_SIZE and all data layouts remain specialized.
+@triton.jit(
+    do_not_specialize=[
+        "block_tables_ptr",
+        "stride_bt_batch",
+    ]
+)
+def paged_decode_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    o_ptr,
+    seqlens_ptr,
+    block_tables_ptr,
+    sinks_ptr,
+    BATCH_SIZE,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_k_block,
+    stride_k_head,
+    stride_k_blksz,
+    stride_k_dim,
+    stride_v_block,
+    stride_v_head,
+    stride_v_blksz,
+    stride_v_dim,
+    stride_ob,
+    stride_oh,
+    stride_od,
+    stride_bt_batch,
+    stride_bt_block,
+    stride_sink_head,
+    softmax_scale,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    GQA_INTERLEAVE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    SINK_ENABLED: tl.constexpr,
+):
+    _paged_decode_child(
+        q_ptr, k_cache_ptr, v_cache_ptr, o_ptr, seqlens_ptr, block_tables_ptr, sinks_ptr,
+        BATCH_SIZE, stride_qb, stride_qh, stride_qd,
+        stride_k_block, stride_k_head, stride_k_blksz, stride_k_dim,
+        stride_v_block, stride_v_head, stride_v_blksz, stride_v_dim,
+        stride_ob, stride_oh, stride_od, stride_bt_batch, stride_bt_block,
+        stride_sink_head, softmax_scale, NUM_Q_HEADS, NUM_KV_HEADS, GQA_INTERLEAVE,
+        HEAD_DIM, PAGE_SIZE, BLOCK_SIZE_D, BLOCK_SIZE_N, SINK_ENABLED,
+        tl.program_id(0), tl.num_programs(0),
+    )
 
 
 @triton.jit(

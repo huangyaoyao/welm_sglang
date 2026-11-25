@@ -2584,6 +2584,51 @@ def welmv4_oe_hash_prefill_4way_npu(
     return output
 
 
+@triton.jit
+def _welmv4_oe_concat_4way_kernel(x0, x1, x2, x3, output, WIDTH: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, WIDTH)
+    src = row * WIDTH + cols
+    dst = row * (4 * WIDTH) + cols
+    tl.store(output + dst, tl.load(x0 + src))
+    tl.store(output + dst + WIDTH, tl.load(x1 + src))
+    tl.store(output + dst + 2 * WIDTH, tl.load(x2 + src))
+    tl.store(output + dst + 3 * WIDTH, tl.load(x3 + src))
+
+
+def welmv4_oe_concat_4way(outputs):
+    """Concatenate the four dense BF16 OE lookup rows during MK decode."""
+    from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        welm_decode_tiles_active,
+    )
+
+    if welm_decode_tiles_active() and len(outputs) == 4:
+        import torch_npu
+
+        first = outputs[0]
+        if (
+            first.device.type == "npu"
+            and torch.npu.get_device_name(first.device).startswith("Ascend950")
+            and first.ndim == 2
+            and first.shape[0] > 0
+            and first.shape[1] == 512
+            and all(
+                x.device == first.device
+                and x.shape == first.shape
+                and x.dtype == torch.bfloat16
+                and x.is_contiguous()
+                and x.storage_offset() % 16 == 0
+                and torch_npu.get_npu_format(x) in (0, 2)
+                for x in outputs
+            )
+        ):
+            rows, width = first.shape
+            output = torch.empty((rows, 4 * width), dtype=first.dtype, device=first.device)
+            _welmv4_oe_concat_4way_kernel[(rows,)](*outputs, output, WIDTH=width)
+            return output
+    return torch.cat(tuple(outputs), dim=-1)
+
+
 def _welmv4_oe_hash_output(batch_size, block_b, device, *, can_pad=True):
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
         welm_decode_tiles_active,

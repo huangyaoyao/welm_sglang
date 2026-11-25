@@ -132,6 +132,58 @@ class WelmAttentionTilesTest(unittest.TestCase):
 
 
 class WelmAttentionDeviceTest(unittest.TestCase):
+    def test_paged_decode_mixed_replays_page_table_and_lengths(self):
+        try:
+            import torch
+            import torch_npu
+        except ImportError as exc:
+            self.skipTest(f"requires torch and torch_npu: {exc}")
+        if not torch.npu.is_available() or not torch.npu.get_device_name().startswith("Ascend950"):
+            self.skipTest("requires an Ascend A5 NPU")
+        from megakernel._fixed import capture_fixed
+        from megakernel.triton import prepare_bindings
+        from sglang.srt.hardware_backend.npu.attention.sink_full_attention import (
+            paged_attention_decode_impl,
+        )
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+            decode_tile_scope,
+            install_welm_tile_layouts,
+        )
+
+        with torch.inference_mode(), tempfile.TemporaryDirectory() as directory:
+            q = torch.randn(2, 24, 256, dtype=torch.bfloat16, device="npu")
+            k, v = [
+                torch.randn(16, 64, 2, 256, dtype=q.dtype, device=q.device).transpose(1, 2)
+                for _ in range(2)
+            ]
+            sinks = torch.randn(24, dtype=torch.float32, device=q.device)
+            lengths = torch.tensor([7, 1], dtype=torch.int32, device=q.device)
+            pages = torch.arange(16, dtype=torch.int32, device=q.device).view(2, 8)
+
+            def forward():
+                return paged_attention_decode_impl(
+                    q, k, v, lengths, pages, False, sinks=sinks, max_kv_len_hint=512
+                )
+
+            install_welm_tile_layouts()
+            with decode_tile_scope():
+                with prepare_bindings():
+                    forward()
+                graph = capture_fixed(forward, Path(directory))
+            try:
+                self.assertEqual(graph.host_boundary_count, 0)
+                self.assertEqual(graph.fused_operator_count, 1)
+                self.assertTrue(any(t and t.get("core") == 3 for t in graph.tasks))
+                for seq in ([64, 65], [511, 512]):
+                    lengths.copy_(torch.tensor(seq, dtype=lengths.dtype, device=q.device))
+                    pages.copy_(pages.roll(1, dims=1))
+                    q.normal_()
+                    expected = forward().cpu()
+                    graph.outputs.fill_(float("nan"))
+                    torch.testing.assert_close(graph.replay().cpu(), expected, rtol=0, atol=0)
+            finally:
+                graph.reset()
+
     def test_post_attention_and_fused_norm_replay(self):
         try:
             import torch

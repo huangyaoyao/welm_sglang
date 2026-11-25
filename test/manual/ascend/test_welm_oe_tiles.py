@@ -76,6 +76,76 @@ class OeTileTest(unittest.TestCase):
 
 
 class OeTileDeviceTest(unittest.TestCase):
+    def test_four_lookup_concat_capture_and_fallbacks(self):
+        from contextlib import nullcontext
+        from tempfile import TemporaryDirectory
+
+        try:
+            import torch
+            import torch_npu
+        except ImportError as error:
+            self.skipTest(f"A5 test requires torch and torch_npu: {error}")
+        if not torch.npu.is_available() or not torch.npu.get_device_name().startswith("Ascend950"):
+            self.skipTest("requires an Ascend A5 NPU")
+        from megakernel._fixed import capture_fixed
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+            decode_tile_scope, install_welm_tile_layouts,
+        )
+        from sglang.srt.layers import vocab_parallel_embedding as embedding
+
+        # Single-rank fixture for the public concat/reduce path, without a process group.
+        layer = embedding.VocabParallelEmbedding.__new__(embedding.VocabParallelEmbedding)
+        torch.nn.Module.__init__(layer)
+        layer.tp_size = 1
+
+        def forward(inputs, dim):
+            return layer.concat_and_reduce_local_outputs(inputs, dim)
+
+        install_welm_tile_layouts()
+        gen = torch.Generator().manual_seed(42)
+        with (
+            torch.inference_mode(),
+            patch.object(embedding, "get_tp_group", return_value=None),
+            patch.object(embedding, "is_allocation_symmetric", return_value=False),
+            patch.object(embedding, "use_symmetric_memory", return_value=nullcontext()),
+        ):
+            for rows, dim in ((1, -1), (2, 1), (8, -1)):
+                with self.subTest(rows=rows, dim=dim), TemporaryDirectory() as build:
+                    inputs = tuple(torch.zeros((rows, 512), device="npu", dtype=torch.bfloat16)
+                                   for _ in range(4))
+                    with decode_tile_scope():
+                        plan = capture_fixed(lambda: forward(inputs, dim), build, tile_chains=True)
+                    try:
+                        self.assertEqual(plan.host_boundary_count, 0, plan.execution_summary)
+                        self.assertEqual(plan.scope_count, 1, plan.execution_summary)
+                        self.assertEqual(plan.fused_operator_count, 1, plan.execution_summary)
+                        for _ in range(3):
+                            values = [torch.randn(x.shape, generator=gen).bfloat16() for x in inputs]
+                            for target, value in zip(inputs, values):
+                                target.copy_(value)
+                            plan.outputs.fill_(float("nan"))
+                            actual = plan.replay().cpu()
+                            torch.testing.assert_close(actual, torch.cat(values, dim), rtol=0, atol=0)
+                    finally:
+                        plan.reset()
+
+            # Full-width decode has an opt-in native implementation. Every other
+            # input contract still follows the existing torch.cat path.
+            for case, xs, dim, active in (
+                ("eager", inputs, -1, False),
+                ("row dimension", inputs, 0, True),
+                ("three branches", inputs[:3], -1, True),
+                ("strided", tuple(torch.stack((x, x), dim=-1)[..., 0] for x in inputs), -1, True),
+                ("unequal widths", (inputs[0][:, :128], *inputs[1:]), -1, True),
+                ("float32", tuple(x.float() for x in inputs), -1, True),
+            ):
+                with self.subTest(case=case), (decode_tile_scope() if active else nullcontext()):
+                    reference = torch.cat(xs, dim)
+                    with patch.object(torch, "cat", wraps=torch.cat) as default_cat:
+                        actual = forward(xs, dim)
+                    default_cat.assert_called_once()
+                    torch.testing.assert_close(actual.cpu(), reference.cpu(), rtol=0, atol=0)
+
     def test_decode_hash_to_draft_hash_reads_one_plane(self):
         try:
             import torch

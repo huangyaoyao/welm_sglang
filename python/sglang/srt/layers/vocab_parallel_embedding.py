@@ -621,7 +621,12 @@ class VocabParallelEmbedding(torch.nn.Module):
             get_tp_group(), disabled=not is_allocation_symmetric()
         )
         with symm_alloc:
-            output_parallel = torch.cat(tuple(outputs), dim=dim)
+            if _is_npu and (dim == -1 or (dim == 1 and outputs[0].ndim == 2)):
+                from sglang.srt.layers.welmv4_npu_op import welmv4_oe_concat_4way
+
+                output_parallel = welmv4_oe_concat_4way(outputs)
+            else:
+                output_parallel = torch.cat(tuple(outputs), dim=dim)
         return self.reduce_local_output(output_parallel)
 
     def forward(self, input_):
