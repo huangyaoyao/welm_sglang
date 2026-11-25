@@ -153,12 +153,12 @@ class WelmNativeBackendTest(unittest.TestCase):
 
         policy = []
         module.capture_fixed = capable
-        for variant in ("single", "bs2", "tp", "dp", "ep", "pp", "draft", "verify", "mtp", "a3", "tile", "default"):
+        for variant in ("single", "bs2", "bs4", "bs8", "bs3", "bs16", "tp", "dp", "ep", "pp", "draft", "verify", "mtp", "a3", "tile", "default"):
             with self.subTest(variant=variant):
                 runner = self.runner("WeLMV4MoeForCausalLM")
                 key = Key()
-                if variant == "bs2":
-                    key.size = 2
+                if variant.startswith("bs"):
+                    key.size = int(variant[2:])
                 if variant in ("tp", "dp", "ep", "pp"):
                     setattr(runner.model_runner.server_args, variant + "_size", 2)
                 if variant == "draft":
@@ -175,7 +175,7 @@ class WelmNativeBackendTest(unittest.TestCase):
                     elif variant == "default":
                         os.environ.pop("MK_NATIVE_TILE_DEPENDENCIES")
                     self.backend_cls(runner).capture_one(key, lambda: None)
-                self.assertEqual(policy[-1], variant == "single")
+                self.assertEqual(policy[-1], variant in ("single", "bs2", "bs4", "bs8"))
         # An older MK backend lacks the option and still takes the original path.
         module.capture_fixed = lambda fn, directory, *, prepared, tile_chains: self.plan
         with patch.dict(os.environ, {"MK_NATIVE_TILE_DEPENDENCIES": "0"}):

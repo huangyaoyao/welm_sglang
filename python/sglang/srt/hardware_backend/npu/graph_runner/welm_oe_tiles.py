@@ -47,7 +47,7 @@ def _verify_hash(ids, table, requests, offsets, lengths, starts, output, tokens,
 
 def _lookup_4way(ids, w0, w1, w2, w3, output, *, PITCH, WIDTH):
     # Lookup rows change at replay. Each branch may read anywhere in its table.
-    return dict(count=1, block=1, reads=[], shared_reads=[ids, w0, w1, w2, w3],
+    return dict(count=output.shape[0], block=1, reads=[], shared_reads=[ids, w0, w1, w2, w3],
                 writes=[(output, 4 * WIDTH * output.element_size())])
 
 

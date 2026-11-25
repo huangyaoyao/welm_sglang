@@ -31,6 +31,15 @@ class OeTileTest(unittest.TestCase):
             self.assertTrue(active())
         self.assertFalse(active())
 
+    def test_four_lookup_writes_one_complete_output_row_per_program(self):
+        for batch in (1, 2, 4, 8):
+            ids, out = tensor((4, batch)), tensor((batch, 2048), width=2)
+            tables = [tensor((17, 512), width=2) for _ in range(4)]
+            layout = oe["_lookup_4way"](ids, *tables, out, PITCH=128, WIDTH=512)
+            self.assertEqual((layout["count"], layout["block"]), (batch, 1))
+            self.assertEqual(layout["shared_reads"], [ids, *tables])
+            self.assertEqual(layout["writes"], [(out, 4096)])
+
     def test_decode_table_read_and_four_output_planes(self):
         ids, rows, starts = [tensor((257,)) for _ in range(3)]
         table, out = tensor((512, 128)), tensor((4, 257))

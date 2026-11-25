@@ -1321,7 +1321,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 router_logits = None
                 if (
                     self.tp_size == 1
-                    and hidden_states.shape[0] == 1
                     and welm_single_pk_decode_active()
                 ):
                     from sglang.srt.hardware_backend.npu.graph_runner.welm_narrow_projection import (
@@ -2000,7 +1999,6 @@ class Qwen2MoeAttention(nn.Module):
         layer = self.gate_proj
         if (
             _is_npu
-            and hidden_states.shape[0] == 1
             and welm_single_pk_decode_active()
             and type(layer) is ColumnParallelLinear
             and layer.tp_size == 1

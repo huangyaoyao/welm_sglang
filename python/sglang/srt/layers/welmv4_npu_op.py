@@ -2593,6 +2593,9 @@ def _welmv4_oe_row_offset(index, WIDTH: tl.constexpr):
 @triton.jit
 def _welmv4_oe_lookup_4way_kernel(ids, w0, w1, w2, w3, output,
                                   PITCH: tl.constexpr, WIDTH: tl.constexpr):
+    row = tl.program_id(0)
+    ids = ids + row
+    output = output + row * (4 * WIDTH)
     cols = tl.arange(0, WIDTH)
     i0 = _welmv4_oe_row_offset(tl.load(ids), WIDTH)
     i1 = _welmv4_oe_row_offset(tl.load(ids + PITCH), WIDTH)
@@ -2605,12 +2608,13 @@ def _welmv4_oe_lookup_4way_kernel(ids, w0, w1, w2, w3, output,
 
 
 def try_welmv4_oe_lookup_4way_npu(ids, embeddings, vocab_sizes):
-    """Gather a single decode token from four unsharded BF16 OE tables."""
+    """Gather each decode token from four unsharded BF16 OE tables."""
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
         welm_single_pk_decode_active,
     )
 
-    if not welm_single_pk_decode_active() or ids.shape != (4, 1):
+    if (not welm_single_pk_decode_active() or ids.ndim != 2
+            or ids.shape[0] != 4 or ids.shape[1] not in (1, 2, 4, 8)):
         return None
 
     import torch_npu
@@ -2622,7 +2626,7 @@ def try_welmv4_oe_lookup_4way_npu(ids, embeddings, vocab_sizes):
         ids.device.type != "npu"
         or not torch.npu.get_device_name(ids.device).startswith("Ascend950")
         or ids.dtype not in (torch.int32, torch.int64)
-        or ids.stride(0) < 1
+        or ids.stride(1) != 1 or ids.stride(0) < ids.shape[1]
         or len(embeddings) != 4
         or len(vocab_sizes) != 4
         or envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
@@ -2652,8 +2656,9 @@ def try_welmv4_oe_lookup_4way_npu(ids, embeddings, vocab_sizes):
         elif torch_npu.get_npu_format(weight) not in (0, 2):
             return None
         weights.append(weight)
-    output = torch.empty((1, 2048), device=ids.device, dtype=torch.bfloat16)
-    _welmv4_oe_lookup_4way_kernel[(1,)](
+    batch = ids.shape[1]
+    output = torch.empty((batch, 2048), device=ids.device, dtype=torch.bfloat16)
+    _welmv4_oe_lookup_4way_kernel[(batch,)](
         ids, *weights, output, PITCH=ids.stride(0), WIDTH=512
     )
     return output

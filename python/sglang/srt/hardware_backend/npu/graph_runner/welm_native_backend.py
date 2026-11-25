@@ -76,7 +76,7 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         directory.mkdir(exist_ok=True, parents=True)
         single_pk = (
             self._single_pk_worker
-            and getattr(shape_key, "size", None) == 1
+            and getattr(shape_key, "size", None) in (1, 2, 4, 8)
             and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "0"
             and "retain_intermediates" in signature(capture_fixed).parameters
         )

@@ -1,10 +1,15 @@
-"""Exercise the BS1 attention gate and FP32 MoE router inside one A5 parent."""
+"""Exercise the BS1/2/4/8 attention gate and FP32 MoE router inside one A5 parent."""
 import tempfile
 import unittest
 
 
 class NarrowProjectionTest(unittest.TestCase):
     def test_changed_weights_and_close_router_scores(self):
+        for rows in (1, 2, 4, 8):
+            with self.subTest(batch_size=rows):
+                self._check_bucket(rows)
+
+    def _check_bucket(self, rows):
         import torch
         import torch_npu
 
@@ -19,7 +24,7 @@ class NarrowProjectionTest(unittest.TestCase):
         from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import decode_tile_scope
 
         rng = torch.Generator().manual_seed(163)
-        x = torch.zeros(1, 2048, dtype=torch.bfloat16, device="npu")
+        x = torch.zeros(rows, 2048, dtype=torch.bfloat16, device="npu")
         gate = x.new_zeros((24, 2048))
         router = x.new_zeros((2048, 512))
         # The same logical router weight can also be stored as contiguous [N,K].
@@ -29,6 +34,7 @@ class NarrowProjectionTest(unittest.TestCase):
         with decode_tile_scope():
             self.assertIsNone(narrow_projection(x, gate, router=False))
         with decode_tile_scope(single_pk=True):
+            self.assertIsNone(narrow_projection(x.new_zeros((3, 2048)), gate, router=False))
             self.assertIsNone(narrow_projection(x, gate[:16], router=False))
             self.assertIsNone(narrow_projection(x, gate.t().contiguous().t(), router=False))
         with torch.inference_mode(), tempfile.TemporaryDirectory() as build:
@@ -49,14 +55,15 @@ class NarrowProjectionTest(unittest.TestCase):
                 self.assertFalse(plan.execution_summary["native_globals"])
                 for i in range(5):
                     if i < 4:
-                        values = torch.randn((1, 2048), generator=rng).bfloat16()
+                        values = torch.randn((rows, 2048), generator=rng).bfloat16()
                         gate_values = torch.randn((24, 2048), generator=rng).bfloat16()
                         router_values = torch.randn((2048, 512), generator=rng).bfloat16()
                     else:
                         # Logits within one BF16 ULP. FP32 scores remain distinct,
                         # and the exact ordering of the ten highest scores matters.
-                        values = torch.zeros((1, 2048), dtype=torch.bfloat16)
-                        values[0,:2] = 1
+                        values = torch.zeros((rows, 2048), dtype=torch.bfloat16)
+                        values[:, 0] = 1
+                        values[:, 1] = torch.arange(1, rows + 1)
                         gate_values = torch.ones((24, 2048), dtype=torch.bfloat16)
                         router_values = torch.zeros((2048, 512), dtype=torch.bfloat16)
                         router_values[0,:] = 1
@@ -70,6 +77,8 @@ class NarrowProjectionTest(unittest.TestCase):
                     for out in plan.outputs:
                         out.fill_(float('nan'))
                     g, a, b = (o.cpu() for o in plan.replay())
+                    self.assertEqual(g.shape, (rows, 24))
+                    self.assertEqual(a.shape, (rows, 512))
                     self.assertEqual(g.dtype, torch.bfloat16)
                     self.assertEqual(a.dtype, torch.float32)
                     torch.testing.assert_close(g, gate_ref, rtol=0, atol=0)
