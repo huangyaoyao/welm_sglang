@@ -403,6 +403,9 @@ class AscendAttnBackend(AttentionBackend):
         self.use_mk_paged_kv = self.use_welm_flash_attn and get_bool_env_var(
             "SGLANG_NPU_WELMV4_MK_PAGED_KV", "False"
         )
+        self.use_mk_page_attention = self.use_welm_flash_attn and get_bool_env_var(
+            "SGLANG_NPU_WELMV4_MK_PAGE_ATTENTION", "False"
+        )
         if self.use_welm_flash_attn:
             # Optional dependency: the default Triton path does not import it.
             import cann_ops_transformer
@@ -3735,7 +3738,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output
 
-    def _stage_welm_decode_kv(self, layer, batch, k, v):
+    def _try_welm_decode_page_attention(self, layer, batch, q, k, v, sinks):
         from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
             welm_decode_tile_workspace,
         )
@@ -3764,9 +3767,23 @@ class AscendAttnBackend(AttentionBackend):
             return None
         keys = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 64, 2, 256)
         values = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view_as(keys)
-        return stage_flash_kv(k, v, slots, keys, values, table,
-                              self.forward_metadata.welm_flash_seqused_kv,
-                              workspace)
+        lengths = self.forward_metadata.welm_flash_seqused_kv
+        if (self.use_mk_page_attention and self.forward_metadata.welm_decode_metadata_in_graph
+                and not layer.is_cross_attention):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_page_attention import (
+                try_page_attention,
+            )
+
+            window = layer.sliding_window_size if self._has_layerwise_sliding_window(layer) else -1
+            out = try_page_attention(q, k, v, slots, keys, values, table, lengths,
+                                     sinks, window, layer.scaling, workspace)
+            if out is not None:
+                return out.view(batch.batch_size, -1)
+        if self.use_mk_paged_kv:
+            operands = stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace)
+            if operands is not None:
+                return self._forward_welm_flash_attention(q, *operands, layer, sinks)
+        return None
 
     def forward_decode_graph(
         self,
@@ -3780,10 +3797,10 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        if save_kv_cache and self.use_mk_paged_kv and not self.use_mla:
-            operands = self._stage_welm_decode_kv(layer, forward_batch, k, v)
-            if operands is not None:
-                return self._forward_welm_flash_attention(q, *operands, layer, sinks)
+        if save_kv_cache and (self.use_mk_paged_kv or self.use_mk_page_attention) and not self.use_mla:
+            out = self._try_welm_decode_page_attention(layer, forward_batch, q, k, v, sinks)
+            if out is not None:
+                return out
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)

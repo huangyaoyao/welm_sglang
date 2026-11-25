@@ -56,8 +56,8 @@ def _read_flash_pages(keys, values, table, lengths, flash_k, flash_v,
                     tl.store(flash_v + addr, tl.load(values + addr))
 
 
-def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace, *, copy_pages=True):
-    """Write KV and return the staged or persistent Flash operands when supported."""
+def _validated_page_group(k, v, slots, keys, values, table, lengths):
+    """Check all cache/slot operands without allocating or submitting device writes."""
     import torch_npu
 
     if not welm_decode_tiles_active() or slots is None or table is None or lengths is None:
@@ -82,22 +82,36 @@ def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace, *, copy
             or any(torch_npu.get_npu_format(t) not in (0, 2) for t in (keys, values, k, v))):
         return None
 
+    return triton.cdiv(keys.shape[0], 16)
+
+
+def _write_grouped_kv(k, v, slots, keys, values, group):
     pages = keys.shape[0]
-    group = triton.cdiv(pages, 16)
     grid = (triton.cdiv(pages, group),)
+    _write_kv_pages[grid](k, v, slots, keys, values, k.stride(0), v.stride(0),
+                          pages, group, slots.shape[0])
+
+
+def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace, *, copy_pages=True):
+    """Write KV and return the staged or persistent Flash operands when supported."""
+    group = _validated_page_group(k, v, slots, keys, values, table, lengths)
+    if group is None:
+        return None
+    pages = keys.shape[0]
     if copy_pages:
         # The graph bucket owns this scratch. Equal geometries reuse it across
         # layers; Flash consumes it before the next layer can overwrite it.
-        cache_key = (device, pages)
+        cache_key = (keys.device, pages)
         if cache_key not in workspace:
             workspace[cache_key] = (torch.zeros_like(keys), torch.zeros_like(values))
         flash_k, flash_v = workspace[cache_key]
-    _write_kv_pages[grid](k, v, slots, keys, values, k.stride(0), v.stride(0), pages, group, rows)
+    _write_grouped_kv(k, v, slots, keys, values, group)
     if not copy_pages:
         return keys, values
     columns = table.shape[1]
+    grid = (triton.cdiv(pages, group),)
     _read_flash_pages[grid](keys, values, table, lengths, flash_k, flash_v,
-                            pages, group, columns, rows)
+                            pages, group, columns, slots.shape[0])
     return flash_k, flash_v
 
 
