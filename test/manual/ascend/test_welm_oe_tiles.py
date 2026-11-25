@@ -19,6 +19,18 @@ def tensor(shape, width=4):
 
 
 class OeTileTest(unittest.TestCase):
+    def test_single_pk_policy_is_local_to_explicit_decode_scope(self):
+        active = bindings["welm_single_pk_decode_active"]
+        scope = bindings["decode_tile_scope"]
+        self.assertFalse(active())
+        with scope(single_pk=True):
+            self.assertTrue(active())
+            with scope():
+                self.assertTrue(bindings["welm_decode_tiles_active"]())
+                self.assertFalse(active())
+            self.assertTrue(active())
+        self.assertFalse(active())
+
     def test_decode_table_read_and_four_output_planes(self):
         ids, rows, starts = [tensor((257,)) for _ in range(3)]
         table, out = tensor((512, 128)), tensor((4, 257))

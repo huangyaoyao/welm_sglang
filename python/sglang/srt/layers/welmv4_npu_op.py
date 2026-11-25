@@ -2585,6 +2585,81 @@ def welmv4_oe_hash_prefill_4way_npu(
 
 
 @triton.jit
+def _welmv4_oe_row_offset(index, WIDTH: tl.constexpr):
+    # A BF16 OE table can exceed 4 GiB even though its hash fits in int32.
+    return index.to(tl.int64) * WIDTH
+
+
+@triton.jit
+def _welmv4_oe_lookup_4way_kernel(ids, w0, w1, w2, w3, output,
+                                  PITCH: tl.constexpr, WIDTH: tl.constexpr):
+    cols = tl.arange(0, WIDTH)
+    i0 = _welmv4_oe_row_offset(tl.load(ids), WIDTH)
+    i1 = _welmv4_oe_row_offset(tl.load(ids + PITCH), WIDTH)
+    i2 = _welmv4_oe_row_offset(tl.load(ids + 2 * PITCH), WIDTH)
+    i3 = _welmv4_oe_row_offset(tl.load(ids + 3 * PITCH), WIDTH)
+    tl.store(output + cols, tl.load(w0 + i0 + cols))
+    tl.store(output + WIDTH + cols, tl.load(w1 + i1 + cols))
+    tl.store(output + 2 * WIDTH + cols, tl.load(w2 + i2 + cols))
+    tl.store(output + 3 * WIDTH + cols, tl.load(w3 + i3 + cols))
+
+
+def try_welmv4_oe_lookup_4way_npu(ids, embeddings, vocab_sizes):
+    """Gather a single decode token from four unsharded BF16 OE tables."""
+    from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        welm_single_pk_decode_active,
+    )
+
+    if not welm_single_pk_decode_active() or ids.shape != (4, 1):
+        return None
+
+    import torch_npu
+
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+
+    if (
+        ids.device.type != "npu"
+        or not torch.npu.get_device_name(ids.device).startswith("Ascend950")
+        or ids.dtype not in (torch.int32, torch.int64)
+        or ids.stride(0) < 1
+        or len(embeddings) != 4
+        or len(vocab_sizes) != 4
+        or envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+    ):
+        return None
+    weights = []
+    for embedding, vocab in zip(embeddings, vocab_sizes):
+        if embedding.tp_size != 1 or type(embedding.quant_method) is not UnquantizedEmbeddingMethod:
+            return None
+        weight = embedding.weight
+        if (
+            weight.device != ids.device or weight.dtype != torch.bfloat16
+            or weight.ndim != 2 or weight.shape[1] != 512
+            or weight.shape[0] < vocab or not weight.is_contiguous()
+            or weight.data_ptr() % 32
+        ):
+            return None
+        # ACL host mappings are plain contiguous ND, constructed with set_ on
+        # external storage. They have no TorchNPU format descriptor to query.
+        owner = getattr(embedding, "_host_mapped_npu_allocations", {}).get("weight")
+        if owner is None:
+            owner = getattr(weight, "_host_mapped_npu_allocation", None)
+        if owner is not None:
+            if (not owner.registered or owner.closed or weight.data_ptr() != owner.dev_ptr
+                    or weight.numel() * weight.element_size() > owner.tensor_bytes):
+                return None
+        elif torch_npu.get_npu_format(weight) not in (0, 2):
+            return None
+        weights.append(weight)
+    output = torch.empty((1, 2048), device=ids.device, dtype=torch.bfloat16)
+    _welmv4_oe_lookup_4way_kernel[(1,)](
+        ids, *weights, output, PITCH=ids.stride(0), WIDTH=512
+    )
+    return output
+
+
+@triton.jit
 def _welmv4_oe_concat_4way_kernel(x0, x1, x2, x3, output, WIDTH: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, WIDTH)

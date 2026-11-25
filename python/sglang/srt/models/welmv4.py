@@ -106,6 +106,9 @@ from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_npu, make
 if is_npu():
     import torch_npu
 
+    from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        welm_single_pk_decode_active,
+    )
     from sglang.srt.hardware_backend.npu.cmo import (
         prepare_weight_cache,
         wait_cmo_stream,
@@ -122,6 +125,7 @@ if is_npu():
         build_welmv4_rope_segment_tile_starts,
         inplace_sigmoid_mul_npu,
         mmq_style_router_linear_npu,
+        try_welmv4_oe_lookup_4way_npu,
         welmv4_oe_hash_decode_4way_npu,
         welmv4_oe_hash_explicit_history_4way_npu,
         welmv4_oe_hash_prefill_4way_npu,
@@ -1313,11 +1317,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             ):
                 shared_output = self._forward_shared_expert(hidden_states)
             if _is_npu:
-                router_logits = torch.mm(
-                    hidden_states,
-                    self.get_npu_router_compute_weight_t(),
-                    out_dtype=torch.float32,
-                )
+                router_weight = self.get_npu_router_compute_weight_t()
+                router_logits = None
+                if (
+                    self.tp_size == 1
+                    and hidden_states.shape[0] == 1
+                    and welm_single_pk_decode_active()
+                ):
+                    from sglang.srt.hardware_backend.npu.graph_runner.welm_narrow_projection import (
+                        narrow_projection,
+                    )
+
+                    router_logits = narrow_projection(hidden_states, router_weight, router=True)
+                if router_logits is None:
+                    router_logits = torch.mm(hidden_states, router_weight, out_dtype=torch.float32)
             else:
                 router_logits = mmq_style_router_linear(
                     hidden_states, self.gate.weight
@@ -1982,6 +1995,29 @@ class Qwen2MoeAttention(nn.Module):
             and not is_nextn
             and self.kv_mirror_layer_idx not in self.kv_mirror_layers
         )
+
+    def _headwise_gate(self, hidden_states):
+        layer = self.gate_proj
+        if (
+            _is_npu
+            and hidden_states.shape[0] == 1
+            and welm_single_pk_decode_active()
+            and type(layer) is ColumnParallelLinear
+            and layer.tp_size == 1
+            and not layer.gather_output
+            and layer.quant_config is None
+            and layer.bias is None
+            and not layer._forward_pre_hooks
+            and not layer._forward_hooks
+        ):
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_narrow_projection import (
+                narrow_projection,
+            )
+
+            gate = narrow_projection(hidden_states, layer.weight, router=False)
+            if gate is not None:
+                return gate.unsqueeze(-1)
+        return layer(hidden_states)[0].unsqueeze(-1)
 
     def _project_local_qkv(self, x, batch):
         # This is the ordinary three-way projection. Fused mirror K/V and
@@ -3233,7 +3269,7 @@ class Qwen2MoeAttention(nn.Module):
             current_stream = device_module.current_stream()
             self.alt_stream.wait_stream(current_stream)
             with device_module.stream(self.alt_stream):
-                gate = self.gate_proj(hidden_states)[0].unsqueeze(-1)
+                gate = self._headwise_gate(hidden_states)
 
         if fused_qkv is None:
             q_shape = q.shape
@@ -3374,7 +3410,7 @@ class Qwen2MoeAttention(nn.Module):
                             self.alt_stream
                         )
                     gate_input = prefill_gate_hidden_states
-                gate = self.gate_proj(gate_input)[0].unsqueeze(-1)
+                gate = self._headwise_gate(gate_input)
                 if prefill_ag_qkv_slices is not None:
                     # One BF16 Gate MM over the whole chunk-major receive arena.
                     # Restore only [M, local_heads, 1] (6 heads at TP4), not
@@ -4942,23 +4978,29 @@ class Qwen2MoeModel(nn.Module):
         history_num_tokens = hashed_ids.shape[1]
         num_tokens = input_ids.numel()
 
-        emb_ngram = []
-        for i, vs in enumerate(self.oe_vocab_sizes):
-            input_ids_ngram_hashed_tmp = hashed_ids[i]
-            emb_ngram_tmp = (
-                oe_embed_modules[i].forward_local(input_ids_ngram_hashed_tmp)
-                if _is_npu
-                else oe_embed_modules[i](input_ids_ngram_hashed_tmp)
+        emb_ngram_concat = None
+        if _is_npu and prepared_ids is None and forward_batch.forward_mode.is_decode():
+            emb_ngram_concat = try_welmv4_oe_lookup_4way_npu(
+                hashed_ids, oe_embed_modules, self.oe_vocab_sizes
             )
-            emb_ngram.append(emb_ngram_tmp)
-        if _is_npu:
-            # Four native local lookups + native concat + one OE all-reduce.
-            # Base embedding communication remains unchanged in this phase.
-            emb_ngram_concat = oe_embed_modules[0].concat_and_reduce_local_outputs(
-                emb_ngram, dim=-1
-            )
-        else:
-            emb_ngram_concat = torch.cat(emb_ngram, dim=-1)
+        if emb_ngram_concat is None:
+            emb_ngram = []
+            for i, vs in enumerate(self.oe_vocab_sizes):
+                input_ids_ngram_hashed_tmp = hashed_ids[i]
+                emb_ngram_tmp = (
+                    oe_embed_modules[i].forward_local(input_ids_ngram_hashed_tmp)
+                    if _is_npu
+                    else oe_embed_modules[i](input_ids_ngram_hashed_tmp)
+                )
+                emb_ngram.append(emb_ngram_tmp)
+            if _is_npu:
+                # Four native local lookups + native concat + one OE all-reduce.
+                # Base embedding communication remains unchanged in this phase.
+                emb_ngram_concat = oe_embed_modules[0].concat_and_reduce_local_outputs(
+                    emb_ngram, dim=-1
+                )
+            else:
+                emb_ngram_concat = torch.cat(emb_ngram, dim=-1)
         emb_new, _ = oe_up_proj_module(emb_ngram_concat)
         hidden_states = (base_hidden_states[:history_num_tokens] + emb_new) / 2.0
         if history_num_tokens < num_tokens:

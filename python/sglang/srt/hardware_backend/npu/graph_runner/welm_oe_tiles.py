@@ -45,6 +45,12 @@ def _verify_hash(ids, table, requests, offsets, lengths, starts, output, tokens,
                 writes=[], shared_reads=[ids, table], whole_writes=[output])
 
 
+def _lookup_4way(ids, w0, w1, w2, w3, output, *, PITCH, WIDTH):
+    # Lookup rows change at replay. Each branch may read anywhere in its table.
+    return dict(count=1, block=1, reads=[], shared_reads=[ids, w0, w1, w2, w3],
+                writes=[(output, 4 * WIDTH * output.element_size())])
+
+
 def _concat_rows(x0, x1, x2, x3, output, *, WIDTH):
     # The caller has checked all four dense inputs. One program copies a full row.
     row_bytes = WIDTH * output.element_size()
@@ -63,6 +69,7 @@ def install_oe_tiles(native):
     # this binding solely while preparing fixed decode/verification buckets.
     for name, layout in (
         ("_welmv4_oe_concat_4way_kernel", _concat_rows),
+        ("_welmv4_oe_lookup_4way_kernel", _lookup_4way),
         ("_welmv4_oe_hash_decode_4way_kernel", _decode_hash),
         ("_welmv4_oe_hash_explicit_history_4way_kernel", _draft_hash),
         ("_welmv4_oe_hash_prefill_4way_kernel", _verify_hash),

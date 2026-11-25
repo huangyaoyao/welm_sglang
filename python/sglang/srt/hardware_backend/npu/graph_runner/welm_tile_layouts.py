@@ -8,8 +8,8 @@ _decode_active = ContextVar("welm_native_decode_tiles", default=None)
 
 
 @contextmanager
-def decode_tile_scope():
-    token = _decode_active.set({})
+def decode_tile_scope(*, single_pk=False):
+    token = _decode_active.set({"single_pk": True} if single_pk else {})
     try:
         yield
     finally:
@@ -18,6 +18,11 @@ def decode_tile_scope():
 
 def welm_decode_tiles_active():
     return _decode_active.get() is not None
+
+
+def welm_single_pk_decode_active():
+    workspace = _decode_active.get()
+    return workspace is not None and workspace.get("single_pk") is True
 
 
 def welm_decode_tile_workspace():

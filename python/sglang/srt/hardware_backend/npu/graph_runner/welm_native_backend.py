@@ -1,5 +1,6 @@
 """Fixed-buffer WeLM execution using MegaKernel's native capture and replay."""
 
+from inspect import signature
 import logging
 import os
 from contextlib import nullcontext
@@ -33,6 +34,17 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         install_welm_tile_layouts()
         self.device = runner.device_module
         self._retain_if_failed = retain_if_failed
+        args = model_runner.server_args
+        mode = getattr(runner, "capture_forward_mode", None)
+        self._single_pk_worker = (
+            "WeLMV4MoeForCausalLM" in architectures
+            and mode is not None
+            and mode.is_decode()
+            and not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_none()
+            and (args.tp_size, args.dp_size, args.ep_size, args.pp_size) == (1, 1, 1, 1)
+            and self.device.get_device_name().startswith("Ascend950")
+        )
         self.tp_group = model_runner.tp_group
         # Descriptor exports and compiler diagnostics are local to a worker.
         self.directory = Path(_HOME) / "sglang_native_compile" / str(os.getpid())
@@ -52,7 +64,6 @@ class WelmNativeBackend(BaseCudaGraphBackend):
                 "MK quarantined a failed device submission. Please restart the worker."
             )
 
-    @decode_tile_scope()
     def capture_one(
         self, shape_key, forward_fn, capture_inputs=None, post_warmup_hook=None
     ):
@@ -63,31 +74,39 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         key = sha256(repr(shape_key).encode()).hexdigest()[:16]
         directory = self.directory / key
         directory.mkdir(exist_ok=True, parents=True)
-        for _ in range(2):
+        single_pk = (
+            self._single_pk_worker
+            and getattr(shape_key, "size", None) == 1
+            and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "0"
+            and "retain_intermediates" in signature(capture_fixed).parameters
+        )
+        with decode_tile_scope(single_pk=single_pk):
+            for _ in range(2):
+                self.device.synchronize()
+                self.tp_group.barrier()
+                forward_fn()
+                if post_warmup_hook:
+                    post_warmup_hook()
+
+            # Preparation executes a dummy forward. Restore the attention metadata
+            # before recording the actual plan, as after each ordinary warmup.
             self.device.synchronize()
             self.tp_group.barrier()
-            forward_fn()
+            refresh_welm_moe_tiles()
+            with prepare_bindings():
+                prepare_static(forward_fn, directory)
             if post_warmup_hook:
                 post_warmup_hook()
-
-        # Preparation executes a dummy forward. Restore the attention metadata
-        # before recording the actual plan, as after each ordinary warmup.
-        self.device.synchronize()
-        self.tp_group.barrier()
-        refresh_welm_moe_tiles()
-        with prepare_bindings():
-            prepare_static(forward_fn, directory)
-        if post_warmup_hook:
-            post_warmup_hook()
-        self.device.synchronize()
-        self.tp_group.barrier()
-        try:
-            plan = capture_fixed(forward_fn, directory, prepared=True, tile_chains=True)
-        except BaseException:
-            # These caller-owned buffers may still be in flight before a plan
-            # exists. MK retains them only for a quarantined device submission.
-            self._retain_if_failed(self, forward_fn, capture_inputs)
-            raise
+            self.device.synchronize()
+            self.tp_group.barrier()
+            try:
+                opts = {"retain_intermediates": True} if single_pk else {}
+                plan = capture_fixed(forward_fn, directory, prepared=True, tile_chains=True, **opts)
+            except BaseException:
+                # These caller-owned buffers may still be in flight before a plan
+                # exists. MK retains them only for a quarantined device submission.
+                self._retain_if_failed(self, forward_fn, capture_inputs)
+                raise
         previous = self._plans.get(shape_key)
         self._plans[shape_key] = (plan, capture_inputs)
         if previous is not None:
