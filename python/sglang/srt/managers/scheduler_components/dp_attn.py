@@ -143,10 +143,11 @@ class MLPSyncBatchInfo:
         local_info_tensor = self._get_local_tensor(device=device)
         fallback_tensor = self._get_fallback_tensor(device=device)
         info_width = local_info_tensor.numel()
-        # Inactive max_world_size slots must decode as IDLE.
+        # A one-rank expand is already contiguous and aliases its IDLE row.
+        # Collectives overwrite their output, so allocate independent storage.
         global_info_tensor = fallback_tensor.expand(
             self.dp_size, self.tp_size * self.cp_size, info_width
-        ).contiguous()
+        ).clone(memory_format=torch.contiguous_format)
 
         if use_all_reduce:
             # Admission can expose different WORLD sizes; use fixed global slots.
