@@ -1022,6 +1022,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             _is_npu and quant_config is None and not is_nextn
             and get_bool_env_var("SGLANG_NPU_WELMV4_MK_FFN_TILES")
         )
+        self.use_mk_ffn_layer_boundaries = (
+            self.use_mk_ffn_tiles and self.tp_size == 1
+            and get_bool_env_var("SGLANG_NPU_WELMV4_MK_FFN_LAYER_BOUNDARIES", "true")
+            and get_global_server_args().speculative_algorithm is None
+        )
         self.experts.welm_local_ffn_tiles = (
             self.use_mk_ffn_tiles and self.tp_size in (4, 8) and self.experts.moe_ep_size == self.tp_size
             and self.experts.moe_tp_size == 1 and get_parallel().attn_tp_size == 1
@@ -1185,13 +1190,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         tiled_ep = (getattr(self.experts, "welm_local_ffn_tiles", False)
                      and (moe_a2a_backend.is_deepep() or moe_a2a_backend.is_ascend_fuseep()))
         tiled_ffn = False
+        ffn_boundary = None
         if (self.use_mk_ffn_tiles and ((self.tp_size == 1 and moe_a2a_backend.is_none()) or tiled_ep)
                 and forward_batch is not None
-                and forward_batch.forward_mode.is_decode() and not torch.compiler.is_compiling()
+                and forward_batch.forward_mode.is_decode() and getattr(forward_batch, "spec_info", None) is None
+                and not torch.compiler.is_compiling()
                 and (tiled_ep or not envs.SGLANG_NPU_USE_MULTI_STREAM.get())):
             from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import welm_decode_tiles_active
 
             tiled_ffn = welm_decode_tiles_active()
+            if (tiled_ffn and getattr(self, "use_mk_ffn_layer_boundaries", False) and not tiled_ep
+                    and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES", "1") != "0"):
+                import megakernel
+
+                ffn_boundary = getattr(megakernel, "mark_native_boundary", None)
+                # Older MK Python packages run the original FFN when this policy is requested.
+                tiled_ffn = ffn_boundary is not None
         is_prefill_batch = (
             forward_batch is not None
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
@@ -1519,6 +1533,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 from sglang.srt.hardware_backend.npu.graph_runner.welm_ffn_tiles import try_routed_expert
 
                 experts_output = try_routed_expert(hidden_states, topk_output, self.experts)
+                if experts_output is not None and ffn_boundary is not None:
+                    ffn_boundary()
             if experts_output is None:
                 experts_output = self.experts(hidden_states, topk_output)
         if return_components and skip_component_output:
