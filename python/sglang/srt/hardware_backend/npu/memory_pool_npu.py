@@ -1,3 +1,4 @@
+from math import prod
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -9,6 +10,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -89,36 +91,42 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             **kwargs,
         )
 
+    def _use_page_gate_nd_buffers(self, pages: int) -> bool:
+        if (
+            not self.use_fia or not self.use_scatter_pa_kv_cache
+            or self.dtype != torch.bfloat16 or self.store_dtype != self.dtype
+            or self.is_quantized_kv_cache
+            or (self.page_size, self.head_num, self.head_dim, self.v_head_dim) != (64, 2, 256, 256)
+            or not 2 <= pages <= 128
+            or not get_bool_env_var("WELM_NPU_USE_FLASH_ATTN", "False")
+            or not get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_ATTENTION", "False")
+            or not get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES", "False")
+        ):
+            return False
+        try:
+            execution = get_model().model_execution_backend
+        except ValueError:  # Standalone pool without a published worker configuration.
+            return False
+        return execution == "megakernel-native" and torch.npu.get_device_name(self.device).startswith(
+            "Ascend950"
+        )
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # [size, head_num, head_dim] for each layer
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            # Continuous memory improves the efficiency of Ascend`s transmission backend,
-            # while other backends remain unchanged.
-            # Keep the contiguous [layer, page, token, head, dim] allocation
-            # for HiCache IO even when FIA exposes per-layer attention views.
-            self._hicache_k_buffer = torch.zeros(
-                (
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self._hicache_v_buffer = torch.zeros(
-                (
-                    self.layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    self.head_num,
-                    self.v_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
+            pages = self.size // self.page_size + 1
+            use_nd = self._use_page_gate_nd_buffers(pages)
+
+            def allocate(head_dim):
+                shape = (self.layer_num, pages, self.page_size, self.head_num, head_dim)
+                if use_nd:
+                    # Preserve ND storage through the 5D HiCache backing view
+                    # and all per-layer FIA views, including nonzero offsets.
+                    flat = torch.zeros(prod(shape), dtype=self.store_dtype, device=self.device)
+                    return flat.view(shape)
+                return torch.zeros(shape, dtype=self.store_dtype, device=self.device)
+
+            self._hicache_k_buffer = allocate(self.head_dim)
+            self._hicache_v_buffer = allocate(self.v_head_dim)
 
             self.k_buffer = self._hicache_k_buffer
             self.v_buffer = self._hicache_v_buffer

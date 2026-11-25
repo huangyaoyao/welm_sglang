@@ -8,7 +8,7 @@ import triton.language as tl
 from megakernel.triton import native
 
 from .welm_paged_kv import _validated_page_group, _write_grouped_kv
-from .welm_tile_layouts import welm_decode_tiles_active
+from .welm_tile_layouts import record_page_attention_output, welm_decode_tiles_active
 
 
 def _partial_layout(q, keys, values, table, lengths, partials, rows, pages, group,
@@ -150,4 +150,5 @@ def try_page_attention(q, k, v, slots, keys, values, table, lengths, sinks, wind
     _page_attention_partials[(groups,)](q, keys, values, table, lengths, partials, rows, pages,
                                         group, table.shape[1], window, float(scale))
     _merge_page_attention[(rows * 2,)](partials, sinks, out, rows, groups, sinks is not None)
+    record_page_attention_output(out)
     return out

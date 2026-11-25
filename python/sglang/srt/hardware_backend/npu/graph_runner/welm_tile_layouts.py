@@ -9,7 +9,12 @@ _decode_active = ContextVar("welm_native_decode_tiles", default=None)
 
 @contextmanager
 def decode_tile_scope(*, single_pk=False):
-    token = _decode_active.set({"single_pk": True} if single_pk else {})
+    from sglang.srt.utils import get_bool_env_var
+
+    workspace = {"single_pk": True} if single_pk else {}
+    if get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES"):
+        workspace["page_attention_output"] = None
+    token = _decode_active.set(workspace)
     try:
         yield
     finally:
@@ -28,6 +33,31 @@ def welm_single_pk_decode_active():
 def welm_decode_tile_workspace():
     """Scratch shared by layers of this capture, isolated from other plans."""
     return _decode_active.get()
+
+
+def welm_page_gate_tiles_active():
+    workspace = _decode_active.get()
+    return workspace is not None and "page_attention_output" in workspace
+
+
+def record_page_attention_output(output):
+    # Keep only the latest merge alive until its gate uses the result. A bare
+    # address could match an unrelated allocation after the output is freed.
+    workspace = _decode_active.get()
+    if "page_attention_output" in workspace:
+        workspace["page_attention_output"] = output
+
+
+def take_page_attention_output(output):
+    """Recognize the full contiguous view passed through RadixAttention."""
+    workspace = _decode_active.get()
+    merged = workspace.get("page_attention_output") if workspace is not None else None
+    if (merged is None or output.device != merged.device or output.dtype != merged.dtype
+            or output.numel() != merged.numel() or not output.is_contiguous()
+            or output.data_ptr() != merged.data_ptr()):
+        return False
+    workspace["page_attention_output"] = None
+    return True
 
 
 def _decode_native(*, tile_layout, **options):

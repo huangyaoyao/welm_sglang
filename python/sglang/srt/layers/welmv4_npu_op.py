@@ -2945,8 +2945,17 @@ def sigmoid_mul_kernel_npu(
 def inplace_sigmoid_mul_npu(
     x: torch.Tensor,
     y: torch.Tensor,
-    BLOCK_SIZE: int = 128,
+    BLOCK_SIZE: Optional[int] = None,
 ) -> None:
+    from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        take_page_attention_output,
+    )
+
+    # One page-merge program writes twelve heads. Three gate programs can
+    # consume that region as soon as the merge and the gate values are ready.
+    page_output = not torch.compiler.is_compiling() and take_page_attention_output(y)
+    if BLOCK_SIZE is None:
+        BLOCK_SIZE = 4 if page_output else 128
     cols = y.shape[-1]
     rows = y.numel() // cols
 

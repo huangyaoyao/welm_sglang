@@ -107,6 +107,7 @@ if is_npu():
     import torch_npu
 
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        welm_page_gate_tiles_active,
         welm_single_pk_decode_active,
     )
     from sglang.srt.hardware_backend.npu.cmo import (
@@ -1978,6 +1979,10 @@ class Qwen2MoeAttention(nn.Module):
             )
         self.is_nextn = is_nextn
 
+        self.supports_mk_page_gate = (
+            _is_npu and not is_nextn and quant_config is None
+            and (self.num_heads, self.num_kv_heads, self.head_dim) == (24, 2, 256)
+        )
         self.use_mk_bf16_qkv = (
             _is_npu
             and os.environ.get("SGLANG_NPU_WELMV4_MK_BF16_QKV", "0") == "1"
@@ -3059,6 +3064,20 @@ class Qwen2MoeAttention(nn.Module):
                 fused_qkv = self._try_npu_fused_qkv(
                     positions, hidden_states, forward_batch
                 )
+        gate = None
+        if (
+            self.supports_mk_page_gate and self.gated_self_attention_headwise
+            and fused_qkv is None and forward_batch.welm_prefill_graph is None
+            and forward_batch.forward_mode.is_decode() and not torch.compiler.is_compiling()
+            and welm_page_gate_tiles_active()
+            and hidden_states.dtype == torch.bfloat16 and hidden_states.shape[0] in (1, 2, 4, 8)
+            and (self.alt_stream is None or not envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+            and getattr(get_attn_backend(), "use_mk_page_attention", False)
+        ):
+            # This projection only reads the input hidden states. Its CANN
+            # matmul can start a new MK segment, so run it before the QKV/page
+            # chain to keep the in-place gate in the same segment as the merge.
+            gate = self._headwise_gate(hidden_states)
         if fused_qkv is not None:
             q, k, v, mirror_k, mirror_v = fused_qkv
             if mirror_k is not None:
@@ -3230,7 +3249,6 @@ class Qwen2MoeAttention(nn.Module):
             else:
                 q, k, v = self._project_local_qkv(hidden_states, forward_batch)
 
-        gate = None
         is_prefill_batch = (
             forward_batch is not None
             and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
