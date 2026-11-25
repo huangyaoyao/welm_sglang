@@ -5375,7 +5375,7 @@ class Qwen2MoeModel(nn.Module):
                     else:
                         hidden_states = hidden_states.float() + residual.float()
                     pre_norm_hidden_states = hidden_states.to(self.norm.weight.dtype)
-                    if (getattr(self, "_mk_lm_head_tiles", False)
+                    if (getattr(self, "_mk_final_norm_tiles", False)
                             and forward_batch.forward_mode.is_decode()
                             and not torch.compiler.is_compiling()):
                         from sglang.srt.hardware_backend.npu.graph_runner.welm_lm_head import (
@@ -5455,6 +5455,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
         )
         if (_is_npu and quant_config is None and get_bool_env_var("SGLANG_NPU_WELMV4_MK_LM_HEAD_TILES")
                 and get_global_server_args().model_execution_backend == "megakernel-native"
+                and get_global_server_args().speculative_algorithm is None
                 and not get_global_server_args().enable_lora
                 and (config.vocab_size, config.hidden_size) == (155648, 2048)
                 and self.lm_head.tp_size in (1, 4, 8)):
@@ -5463,7 +5464,7 @@ class WeLMV4MoeForCausalLM(nn.Module):
             )
 
             self.logits_processor = WelmDecodeLogitsProcessor(config)
-            self.model._mk_lm_head_tiles = self.logits_processor.supports_welm_head_tiles()
+            self.model._mk_final_norm_tiles = self.logits_processor.supports_welm_final_norm_tiles()
         else:
             self.logits_processor = LogitsProcessor(config)
         # For EAGLE3 support

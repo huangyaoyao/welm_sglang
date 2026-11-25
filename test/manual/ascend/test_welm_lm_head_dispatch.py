@@ -112,6 +112,7 @@ class WelmLogitsDispatchTest(unittest.TestCase):
         for tp, dp, shared, decode, enabled, accepted in (
                 (1, False, True, True, True, True), (1, False, False, True, True, True),
                 (2, False, True, True, True, True), (1, True, True, True, True, True),
+                (4, True, True, True, True, True), (8, True, True, True, True, True),
                 (1, False, True, False, True, False), (1, False, True, True, False, False),
                 (1, False, True, True, True, False)):
             with self.subTest(tp=tp, dp=dp, shared=shared, decode=decode, enabled=enabled, accepted=accepted):
@@ -120,7 +121,7 @@ class WelmLogitsDispatchTest(unittest.TestCase):
                 norm = SimpleNamespace(weight=SimpleNamespace(dtype="bf16", shape=(2048,)), eps=1e-6)
                 fallback = Mock(return_value=object())
                 optimized = Mock(return_value=object() if accepted else None)
-                state = dict(self=SimpleNamespace(norm=norm, end_layer=1, layers=[layer], _mk_lm_head_tiles=enabled),
+                state = dict(self=SimpleNamespace(norm=norm, end_layer=1, layers=[layer], _mk_final_norm_tiles=enabled),
                              hidden_states=Trace("hidden"), residual=Trace("residual"), F=SimpleNamespace(rms_norm=fallback),
                              is_dp_attention_enabled=lambda: dp, torch=SimpleNamespace(compiler=SimpleNamespace(is_compiling=lambda:False)),
                              forward_batch=SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: decode)))
@@ -154,7 +155,33 @@ class WelmLogitsDispatchTest(unittest.TestCase):
                 old = getattr(self.proc, field)
                 setattr(self.proc, field, value)
                 self.assertFalse(self.proc.supports_welm_head_tiles())
+                self.assertEqual(self.proc.supports_welm_final_norm_tiles(), field.startswith("do_tensor_parallel"))
                 setattr(self.proc, field, old)
+
+    def test_model_constructor_final_norm_with_vocab_gather(self):
+        model = SOURCE.parents[3] / "models/welmv4.py"
+        tree = ast.parse(model.read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "WeLMV4MoeForCausalLM")
+        init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+        choose = next(n for n in init.body if isinstance(n, ast.If)
+                      and "SGLANG_NPU_WELMV4_MK_LM_HEAD_TILES" in ast.unparse(n.test))
+        code = compile(ast.Module([choose], []), str(model), "exec")
+        for tp, gather, spec, enabled in ((1, False, None, True), (4, True, None, True),
+                                          (8, True, None, True), (4, True, "EAGLE", False)):
+            with self.subTest(tp=tp, gather=gather, spec=spec):
+                self.proc.do_tensor_parallel_all_gather = self.proc.do_tensor_parallel_all_gather_dp_attn = gather
+                instance = SimpleNamespace(model=SimpleNamespace(), lm_head=SimpleNamespace(tp_size=tp))
+                args = SimpleNamespace(model_execution_backend="megakernel-native", enable_lora=False, speculative_algorithm=spec)
+                old = object()
+                scope = dict(_is_npu=True, quant_config=None, get_bool_env_var=lambda _: True,
+                             self=instance, get_global_server_args=lambda: args,
+                             config=SimpleNamespace(vocab_size=155648, hidden_size=2048), LogitsProcessor=lambda _: old)
+                module = "sglang.srt.hardware_backend.npu.graph_runner.welm_lm_head"
+                with patch.dict(sys.modules, {module: SimpleNamespace(WelmDecodeLogitsProcessor=lambda _: self.proc)}):
+                    exec(code, scope)
+                self.assertIs(instance.logits_processor, self.proc if enabled else old)
+                self.assertEqual(getattr(instance.model, "_mk_final_norm_tiles", False), enabled)
+                self.assertEqual(self.proc.supports_welm_head_tiles(), not gather)
 
     def test_native_and_specialized_variants(self):
         x = object()

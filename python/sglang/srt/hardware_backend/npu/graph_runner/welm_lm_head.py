@@ -141,10 +141,13 @@ def try_welm_logits(x, weight, out):
 
 
 class WelmDecodeLogitsProcessor(LogitsProcessor):
-    def supports_welm_head_tiles(self):
+    def supports_welm_final_norm_tiles(self):
         return (self.vocab_size == _VOCAB and not self.use_fp32_lm_head
                 and self.rl_on_policy_target is None and self.logit_scale is None
-                and not self.final_logit_softcapping and not self.do_tensor_parallel_all_gather
+                and not self.final_logit_softcapping)
+
+    def supports_welm_head_tiles(self):
+        return (self.supports_welm_final_norm_tiles() and not self.do_tensor_parallel_all_gather
                 and not self.do_tensor_parallel_all_gather_dp_attn)
 
     def _get_logits(self, hidden_states, lm_head, logits_metadata, embedding_bias=None,
