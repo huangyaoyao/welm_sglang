@@ -1477,7 +1477,7 @@ class AscendAttnBackend(AttentionBackend):
         """Capture ordinary decode metadata from fixed registry input buffers."""
         metadata = self.forward_metadata
         seq_lens = forward_batch.seq_lens
-        if self.page_size == 64 and seq_lens.shape == (2,):
+        if self.page_size == 64:
             from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
                 welm_decode_tiles_active,
             )
@@ -3741,7 +3741,8 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         workspace = welm_decode_tile_workspace()
-        if (workspace is None or k is None or v is None or batch.batch_size != 2
+        if (workspace is None or k is None or v is None
+                or k.ndim != 3 or k.shape[0] != batch.batch_size
                 or not self.capture_welm_decode_metadata
                 or not batch.forward_mode.is_decode() or self.page_size != 64
                 or (layer.tp_k_head_num, layer.qk_head_dim) != (2, 256)

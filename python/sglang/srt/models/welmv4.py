@@ -1986,7 +1986,7 @@ class Qwen2MoeAttention(nn.Module):
     def _project_local_qkv(self, x, batch):
         # This is the ordinary three-way projection. Fused mirror K/V and
         # query-only calls have their own column layout and stay with SGLang.
-        if self.use_mk_bf16_qkv and batch.forward_mode.is_decode() and x.shape == (2, 2048):
+        if self.use_mk_bf16_qkv and batch.forward_mode.is_decode():
             from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
                 welm_decode_tiles_active,
             )

@@ -1,4 +1,4 @@
-"""Physically partitioned KV writes and paged reads for two-row WeLM decode."""
+"""Physically partitioned KV writes and paged reads for fixed WeLM decode buckets."""
 import torch
 import triton
 import triton.language as tl
@@ -8,7 +8,10 @@ from megakernel.triton import native
 from .welm_tile_layouts import welm_decode_tiles_active
 
 
-def _write_layout(k, v, slots, keys, values, k_stride, v_stride, pages, group):
+_DECODE_BATCH_SIZES = (1, 2, 4, 8)
+
+
+def _write_layout(k, v, slots, keys, values, k_stride, v_stride, pages, group, rows):
     page_bytes = 64 * 512 * keys.element_size()
     return dict(count=pages, block=group, reads=[], shared_reads=[k, v, slots],
                 writes=[(keys, page_bytes), (values, page_bytes)], allow_subviews=True)
@@ -17,17 +20,18 @@ def _write_layout(k, v, slots, keys, values, k_stride, v_stride, pages, group):
 @native(enabled=welm_decode_tiles_active, tile_layout=_write_layout)
 @triton.jit
 def _write_kv_pages(k, v, slots, keys, values, k_stride: tl.constexpr,
-                    v_stride: tl.constexpr, pages: tl.constexpr, group: tl.constexpr):
+                    v_stride: tl.constexpr, pages: tl.constexpr, group: tl.constexpr,
+                    rows: tl.constexpr):
     first = tl.program_id(0) * group
     cols = tl.arange(0, 512)
-    for row in tl.static_range(2):
+    for row in tl.static_range(rows):
         slot = tl.load(slots + row).to(tl.int64)
         if (slot >= first * 64) & (slot < (first + group) * 64) & (slot < pages * 64):
             tl.store(keys + slot * 512 + cols, tl.load(k + row * k_stride + cols))
             tl.store(values + slot * 512 + cols, tl.load(v + row * v_stride + cols))
 
 
-def _read_layout(keys, values, table, lengths, flash_k, flash_v, pages, group, columns):
+def _read_layout(keys, values, table, lengths, flash_k, flash_v, pages, group, columns, rows):
     page_bytes = 64 * 512 * keys.element_size()
     return dict(count=pages, block=group, reads=[(keys, page_bytes), (values, page_bytes)],
                 writes=[(flash_k, page_bytes), (flash_v, page_bytes)],
@@ -37,10 +41,11 @@ def _read_layout(keys, values, table, lengths, flash_k, flash_v, pages, group, c
 @native(enabled=welm_decode_tiles_active, tile_layout=_read_layout)
 @triton.jit
 def _read_flash_pages(keys, values, table, lengths, flash_k, flash_v,
-                      pages: tl.constexpr, group: tl.constexpr, columns: tl.constexpr):
+                      pages: tl.constexpr, group: tl.constexpr, columns: tl.constexpr,
+                      rows: tl.constexpr):
     first = tl.program_id(0) * group
     offsets = tl.arange(0, 2048)
-    for row in tl.static_range(2):
+    for row in tl.static_range(rows):
         length = tl.load(lengths + row)
         for logical in range(tl.minimum(tl.cdiv(length, 64), columns)):
             page = tl.load(table + row * columns + logical)
@@ -57,8 +62,11 @@ def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace):
 
     if not welm_decode_tiles_active() or slots is None or table is None or lengths is None:
         return None
-    if (slots.shape != (2,) or lengths.shape != (2,) or table.ndim != 2
-            or table.shape[0] != 2 or not 1 <= table.shape[1] <= 64
+    if slots.ndim != 1 or slots.shape[0] not in _DECODE_BATCH_SIZES:
+        return None
+    rows = slots.shape[0]
+    if (lengths.shape != (rows,) or table.ndim != 2
+            or table.shape[0] != rows or not 1 <= table.shape[1] <= 64
             or keys.ndim != 4 or keys.shape[1:] != (64, 2, 256)
             or values.shape != keys.shape or not 2 <= keys.shape[0] <= 128
             or slots.dtype not in (torch.int32, torch.int64)
@@ -69,7 +77,7 @@ def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace):
             or any(t.device != device for t in (k, v, values, table, lengths, slots))
             or any(t.dtype != torch.bfloat16 for t in (keys, values, k, v))
             or any(not t.is_contiguous() for t in (keys, values, table, lengths, slots))
-            or any(t.shape != (2, 2, 256) or t.stride()[1:] != (256, 1)
+            or any(t.shape != (rows, 2, 256) or t.stride()[1:] != (256, 1)
                    for t in (k, v))
             or any(torch_npu.get_npu_format(t) not in (0, 2) for t in (keys, values, k, v))):
         return None
@@ -83,10 +91,10 @@ def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace):
     if cache_key not in workspace:
         workspace[cache_key] = (torch.zeros_like(keys), torch.zeros_like(values))
     flash_k, flash_v = workspace[cache_key]
-    _write_kv_pages[grid](k, v, slots, keys, values, k.stride(0), v.stride(0), pages, group)
+    _write_kv_pages[grid](k, v, slots, keys, values, k.stride(0), v.stride(0), pages, group, rows)
     columns = table.shape[1]
     _read_flash_pages[grid](keys, values, table, lengths, flash_k, flash_v,
-                            pages, group, columns)
+                            pages, group, columns, rows)
     return flash_k, flash_v
 
 
@@ -101,7 +109,7 @@ def _metadata_layout(req_map, requests, lengths, slots, mapping, full_table, swa
         shared.append(mapping)
         writes.extend([(swa_table, columns * swa_table.element_size()),
                        (swa_slots, swa_slots.element_size())])
-    return dict(count=2, block=1, reads=reads, writes=writes, shared_reads=shared,
+    return dict(count=requests.numel(), block=1, reads=reads, writes=writes, shared_reads=shared,
                 allow_subviews=True)
 
 
@@ -141,16 +149,19 @@ def prepare_flash_pages(req_map, requests, lengths, slots, full_table, q_used, k
     hybrid = mapping is not None
     if hybrid != (swa_table is not None) or hybrid != (swa_slots is not None):
         return False
-    rows = (requests, lengths, slots, q_used, kv_used)
-    if (any(t is None or t.shape != (2,) for t in rows)
+    if requests is None or requests.ndim != 1 or requests.shape[0] not in _DECODE_BATCH_SIZES:
+        return False
+    rows = requests.shape[0]
+    vectors = (requests, lengths, slots, q_used, kv_used)
+    if (any(t is None or t.shape != (rows,) for t in vectors)
             or req_map.ndim != 2 or req_map.stride(1) != 1
-            or full_table.ndim != 2 or full_table.shape[0] != 2
+            or full_table.ndim != 2 or full_table.shape[0] != rows
             or not 1 <= full_table.shape[1] <= 64
             or not torch.npu.get_device_name(req_map.device).startswith("Ascend950")):
         return False
-    buffers = (*rows, full_table)
+    buffers = (*vectors, full_table)
     if hybrid:
-        if mapping.ndim != 1 or swa_table.shape != full_table.shape or swa_slots.shape != (2,):
+        if mapping.ndim != 1 or swa_table.shape != full_table.shape or swa_slots.shape != (rows,):
             return False
         buffers += (mapping, swa_table, swa_slots)
     if (req_map.dtype not in (torch.int32, torch.int64)
@@ -158,7 +169,7 @@ def prepare_flash_pages(req_map, requests, lengths, slots, full_table, q_used, k
                    or t.dtype not in (torch.int32, torch.int64) for t in buffers)):
         return False
     columns = full_table.shape[1]
-    _prepare_flash_pages[(2,)](
+    _prepare_flash_pages[(rows,)](
         req_map, requests, lengths, slots, mapping, full_table, swa_table, swa_slots,
         q_used, kv_used, req_map.stride(0), req_map.shape[1], mapping.numel() if hybrid else 0,
         columns, triton.next_power_of_2(columns), hybrid,
