@@ -74,13 +74,18 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         key = sha256(repr(shape_key).encode()).hexdigest()[:16]
         directory = self.directory / key
         directory.mkdir(exist_ok=True, parents=True)
-        single_pk = (
+        native_ops_only = (
+            self._single_pk_worker
+            and os.environ.get("SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY") == "1"
+        )
+        retain_intermediates = (
             self._single_pk_worker
             and getattr(shape_key, "size", None) in (1, 2, 4, 8)
-            and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "0"
+            and (native_ops_only or os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "0")
             and "retain_intermediates" in signature(capture_fixed).parameters
         )
-        with decode_tile_scope(single_pk=single_pk):
+        with decode_tile_scope(single_pk=retain_intermediates and not native_ops_only,
+                               native_ops_only=native_ops_only):
             for _ in range(2):
                 self.device.synchronize()
                 self.tp_group.barrier()
@@ -100,7 +105,7 @@ class WelmNativeBackend(BaseCudaGraphBackend):
             self.device.synchronize()
             self.tp_group.barrier()
             try:
-                opts = {"retain_intermediates": True} if single_pk else {}
+                opts = {"retain_intermediates": True} if retain_intermediates else {}
                 plan = capture_fixed(forward_fn, directory, prepared=True, tile_chains=True, **opts)
             except BaseException:
                 # These caller-owned buffers may still be in flight before a plan
@@ -121,6 +126,16 @@ class WelmNativeBackend(BaseCudaGraphBackend):
             plan.host_boundary_count,
             sum(len(scope.tile_dependencies) for scope in plan.plans),
         )
+        if native_ops_only:
+            flashes = incoming = outgoing = 0
+            for scope in plan.plans:
+                flash = {i for i, name in enumerate(scope.kernel_names)
+                         if name.startswith("static_kernel_FlashAttn_")}
+                flashes += len(flash)
+                incoming += sum(dst in flash for _, dst in scope.tile_dependencies)
+                outgoing += sum(src in flash for src, _ in scope.tile_dependencies)
+            logger.info("WeLM native operators %s: %d fused FlashAttn, %d incoming and %d outgoing Flash tile edges",
+                        shape_key, flashes, incoming, outgoing)
         if logger.isEnabledFor(logging.DEBUG):
             for index, scope in enumerate(plan.plans):
                 if scope.tile_dependencies:

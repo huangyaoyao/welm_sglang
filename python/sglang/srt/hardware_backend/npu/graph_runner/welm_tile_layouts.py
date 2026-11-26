@@ -4,18 +4,22 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
 
+_ORIGINAL_KERNELS_ONLY = object()
 _decode_active = ContextVar("welm_native_decode_tiles", default=None)
 
 
 @contextmanager
-def decode_tile_scope(*, single_pk=False):
+def decode_tile_scope(*, single_pk=False, native_ops_only=False):
     from sglang.srt.utils import get_bool_env_var
 
-    workspace = {"single_pk": True} if single_pk else {}
-    if get_bool_env_var("SGLANG_NPU_WELMV4_MK_MODEL_ROW_TILES"):
-        workspace["model_row_tiles"] = True
-    if get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES"):
-        workspace["page_attention_output"] = None
+    if native_ops_only:
+        workspace = _ORIGINAL_KERNELS_ONLY
+    else:
+        workspace = {"single_pk": True} if single_pk else {}
+        if get_bool_env_var("SGLANG_NPU_WELMV4_MK_MODEL_ROW_TILES"):
+            workspace["model_row_tiles"] = True
+        if get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES"):
+            workspace["page_attention_output"] = None
     token = _decode_active.set(workspace)
     try:
         yield
@@ -23,41 +27,47 @@ def decode_tile_scope(*, single_pk=False):
         _decode_active.reset(token)
 
 
-def welm_decode_tiles_active():
+def welm_original_kernels_active():
+    """Bind the model's existing Triton programs in either MK capture mode."""
     return _decode_active.get() is not None
 
 
+def welm_decode_tiles_active():
+    return welm_decode_tile_workspace() is not None
+
+
 def welm_single_pk_decode_active():
-    workspace = _decode_active.get()
+    workspace = welm_decode_tile_workspace()
     return workspace is not None and workspace.get("single_pk") is True
 
 
 def welm_decode_tile_workspace():
     """Scratch shared by layers of this capture, isolated from other plans."""
-    return _decode_active.get()
+    workspace = _decode_active.get()
+    return None if workspace is _ORIGINAL_KERNELS_ONLY else workspace
 
 
 def welm_model_row_tiles_active():
-    workspace = _decode_active.get()
+    workspace = welm_decode_tile_workspace()
     return workspace is not None and workspace.get("model_row_tiles", False)
 
 
 def welm_page_gate_tiles_active():
-    workspace = _decode_active.get()
+    workspace = welm_decode_tile_workspace()
     return workspace is not None and "page_attention_output" in workspace
 
 
 def record_page_attention_output(output):
     # Keep only the latest merge alive until its gate uses the result. A bare
     # address could match an unrelated allocation after the output is freed.
-    workspace = _decode_active.get()
-    if "page_attention_output" in workspace:
+    workspace = welm_decode_tile_workspace()
+    if workspace is not None and "page_attention_output" in workspace:
         workspace["page_attention_output"] = output
 
 
 def take_page_attention_output(output):
     """Recognize the full contiguous view passed through RadixAttention."""
-    workspace = _decode_active.get()
+    workspace = welm_decode_tile_workspace()
     merged = workspace.get("page_attention_output") if workspace is not None else None
     if (merged is None or output.device != merged.device or output.dtype != merged.dtype
             or output.numel() != merged.numel() or not output.is_contiguous()
@@ -78,7 +88,7 @@ def _decode_native(*, tile_layout, **options):
         # declared byte extent against both the view and its owning storage.
         return dict(layout, allow_subviews=True)
 
-    return native(enabled=welm_decode_tiles_active, tile_layout=decode_layout, **options)
+    return native(enabled=welm_original_kernels_active, tile_layout=decode_layout, **options)
 
 
 def _k_norm_layout(
@@ -135,7 +145,7 @@ def install_welm_tile_layouts():
         sink_full_attention.paged_decode_kernel = native(
             child=sink_full_attention._paged_decode_child,
             core="mix",
-            enabled=welm_decode_tiles_active,
+            enabled=welm_original_kernels_active,
         )(sink_full_attention.paged_decode_kernel)
     install_attention_tiles(_decode_native)
     install_oe_tiles(_decode_native)

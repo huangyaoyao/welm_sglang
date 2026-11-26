@@ -181,6 +181,47 @@ class WelmNativeBackendTest(unittest.TestCase):
         with patch.dict(os.environ, {"MK_NATIVE_TILE_DEPENDENCIES": "0"}):
             self.backend_cls(self.runner("WeLMV4MoeForCausalLM")).capture_one(Key(), lambda: None)
 
+    def test_native_ops_preserve_dispatch_in_both_plans(self):
+        from collections import namedtuple
+
+        key = namedtuple("Key", "size")(1)
+        # Exercise the real scope used by forward_fn during warmup and capture.
+        layouts = load(f"{PACKAGE}.welm_tile_layouts",
+                       ROOT / "hardware_backend/npu/graph_runner/welm_tile_layouts.py")
+        # load() executes without installing the module in sys.modules.
+        scope_globals = self.backend_cls.capture_one.__globals__
+        source = self.plan.plans[0]
+        source.kernel_names = ("q", "static_kernel_FlashAttn_example", "gate",
+                               "static_kernel_FlashAttnMetadata_example")
+        source.dependencies = [[], [0], [1], [2]]
+        source.tile_dependencies = [(0, 1), (1, 2), (2, 3)]
+        def capture(fn, directory, *, prepared, tile_chains, retain_intermediates=False):
+            fn()
+            self.assertTrue(retain_intermediates)
+            return self.plan
+
+        def check_dispatch():
+            self.assertTrue(layouts.welm_original_kernels_active())
+            self.assertFalse(layouts.welm_decode_tiles_active())
+            self.assertFalse(layouts.welm_single_pk_decode_active())
+            self.assertFalse(layouts.welm_model_row_tiles_active())
+            self.assertFalse(layouts.welm_page_gate_tiles_active())
+            self.assertIsNone(layouts.welm_decode_tile_workspace())
+
+        settings = {"SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY": "1",
+                    "WELM_NPU_USE_FLASH_ATTN": "1"}
+        utils = SimpleNamespace(get_bool_env_var=lambda name, *args: os.getenv(name) == "1")
+        with patch.dict(sys.modules, {"sglang.srt.utils": utils}), \
+                patch.dict(scope_globals, decode_tile_scope=layouts.decode_tile_scope), \
+                patch.object(sys.modules["megakernel._fixed"], "capture_fixed", capture):
+            for fine in ("0", "1"):
+                with self.subTest(fine=fine), patch.dict(os.environ, settings | {"MK_NATIVE_TILE_DEPENDENCIES": fine}):
+                    with self.assertLogs(f"{PACKAGE}.welm_native_backend", level="INFO") as logs:
+                        self.backend_cls(self.runner("WeLMV4MoeForCausalLM")).capture_one(key, check_dispatch)
+                    self.assertTrue(any("1 fused FlashAttn, 1 incoming and 1 outgoing Flash tile edges" in entry
+                                        for entry in logs.output), logs.output)
+                    self.assertFalse(layouts.welm_original_kernels_active())
+
     def test_reject_unrelated_model(self):
         with self.assertRaisesRegex(ValueError, "WeLMV4"):
             self.backend_cls(self.runner("OtherForCausalLM"))
