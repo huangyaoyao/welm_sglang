@@ -265,6 +265,7 @@ class WelmNativeBackendTest(unittest.TestCase):
             backend.capture_one(stream_key, lambda: None)
             self.assertIsNone(captures[-1])
             with patch.dict(os.environ, {"MK_NATIVE_TILE_DEPENDENCIES": "0"}):
+                self.assertIsNone(self.backend_cls(runner)._workspace_pool)
                 backend.capture_one(Key(2), lambda: None)
                 self.assertIsNone(captures[-1])
             runner.enable_pdmux = True

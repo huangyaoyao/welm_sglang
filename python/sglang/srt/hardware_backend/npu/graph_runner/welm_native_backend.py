@@ -56,6 +56,8 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         if (
             self._native_region_worker and not getattr(runner, "enable_pdmux", False)
             and os.environ.get("SGLANG_NPU_WELMV4_MK_SHARE_DECODE_WORKSPACE") == "1"
+            and os.environ.get("SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY") == "1"
+            and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "1"
         ):
             from megakernel._workspace_pool import FixedWorkspacePool
 
