@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from megakernel.triton import native
+from sglang.srt.utils import get_bool_env_var
 
 from .welm_tile_layouts import welm_decode_tile_workspace, welm_decode_tiles_active
 
@@ -38,6 +39,53 @@ def _welm_row_projection(x, weight, out, K: tl.constexpr, N: tl.constexpr):
         tl.store(dst, acc.to(tl.bfloat16))
 
 
+def _o_partials_layout(x, weight, partials):
+    count = x.shape[0]
+    return dict(count=count, block=1, reads=[(x, 6144 * x.element_size())],
+                writes=[(partials, 4 * 2048 * partials.element_size())],
+                shared_reads=[weight], allow_subviews=True, keep_cube_width=True)
+
+
+@native(core="cube", enabled=welm_decode_tiles_active, tile_layout=_o_partials_layout)
+@triton.jit
+def _welm_o_projection_partials(x, weight, partials):
+    row = tl.program_id(0)
+    # A5 F.linear for [B, 6144] x [2048, 6144] reduces four consecutive
+    # K partitions separately. Keeping the partials in FP32 matters on BF16 ties.
+    for part in range(4):
+        for stripe in range(16):
+            col = stripe * 128
+            partial = tl.full((1, 128), 0, tl.float32)
+            for block in range(12):
+                offset = part * 1536 + block * 128
+                a = tl.make_block_ptr(x + row * 6144, (1, 6144), (6144, 1), (0, offset),
+                                      (1, 128), (1, 0))
+                b = tl.make_block_ptr(weight, (2048, 6144), (6144, 1), (col, offset),
+                                      (128, 128), (1, 0))
+                partial = tl.dot(tl.load(a), tl.trans(tl.load(b)), partial)
+            dst = tl.make_block_ptr(partials + (row * 4 + part) * 2048, (1, 2048),
+                                    (2048, 1), (0, col), (1, 128), (1, 0))
+            tl.store(dst, partial)
+
+
+def _o_merge_layout(partials, out):
+    return dict(count=out.shape[0], block=1,
+                reads=[(partials, 4 * 2048 * partials.element_size())],
+                writes=[(out, 2048 * out.element_size())], allow_subviews=True)
+
+
+@native(enabled=welm_decode_tiles_active, tile_layout=_o_merge_layout)
+@triton.jit
+def _welm_o_projection_merge(partials, out):
+    row = tl.program_id(0)
+    cols = tl.arange(0, 2048)
+    first = partials + row * 4 * 2048 + cols
+    value = tl.load(first) + tl.load(first + 2048)
+    value = value + tl.load(first + 2 * 2048)
+    value = value + tl.load(first + 3 * 2048)
+    tl.store(out + row * 2048 + cols, value.to(tl.bfloat16))
+
+
 def row_projection_eligible(x, weight):
     return (
         welm_decode_tiles_active() and x.ndim == weight.ndim == 2
@@ -55,6 +103,15 @@ def try_row_projection(x, weight):
     if not row_projection_eligible(x, weight):
         return None
     out = x.new_empty((x.shape[0], weight.shape[0]))
+    # Legacy paged Attention requires its original single-child O schedule.
+    # CANN Flash and the Cube page path accept the two-child split-K sequence.
+    if ((x.shape[1], weight.shape[0]) == (6144, 2048)
+            and (not get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_ATTENTION")
+                 or get_bool_env_var("SGLANG_NPU_WELMV4_MK_CUBE_PAGE_ATTENTION"))):
+        partials = x.new_empty((x.shape[0], 4, 2048), dtype=torch.float32)
+        _welm_o_projection_partials[(x.shape[0],)](x, weight, partials)
+        _welm_o_projection_merge[(x.shape[0],)](partials, out)
+        return out
     _welm_row_projection[(x.shape[0],)](x, weight, out, x.shape[1], weight.shape[0])
     return out
 

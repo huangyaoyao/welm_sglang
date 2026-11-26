@@ -75,6 +75,44 @@ class WelmModelRowsTest(unittest.TestCase):
                     finally:
                         plan.reset()
 
+    @patch.dict(os.environ, SGLANG_NPU_WELMV4_MK_PAGE_ATTENTION="0")
+    def test_o_projection_keeps_the_four_k_partial_sums(self):
+        from megakernel._fixed import capture_fixed
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_row_projection import (
+            try_row_projection,
+        )
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import decode_tile_scope
+
+        torch = self.torch
+        # A single FP32 accumulator can lose small products added to 2**25.
+        # Putting them in a different K partition makes their contribution observable.
+        weight = torch.zeros((2048, 6144), dtype=torch.bfloat16)
+        weight[0, 0] = 2**25
+        weight[0, 1536:3072:128] = 1
+        weight[0, 3072] = -(2**25)
+        weight[1] = -weight[0]
+        weight = weight.npu()
+        for batch in (1, 2, 4, 8):
+            with self.subTest(batch=batch), decode_tile_scope(), tempfile.TemporaryDirectory() as build:
+                x = torch.ones((batch, 6144), dtype=torch.bfloat16, device="npu")
+                plan = capture_fixed(lambda: try_row_projection(x, weight), build, tile_chains=True)
+                try:
+                    scope, = [scope for scope in plan.plans
+                              if "_welm_o_projection_partials" in scope.kernel_names]
+                    cube = scope.kernel_names.index("_welm_o_projection_partials")
+                    merge = scope.kernel_names.index("_welm_o_projection_merge")
+                    self.assertIn(cube, scope.dependencies[merge])
+                    if batch > 1:
+                        self.assertIn((cube, merge), scope.tile_dependencies)
+                    for sign in (1, -1):
+                        x.fill_(sign)
+                        expected = torch.nn.functional.linear(x, weight)
+                        self.assertEqual(expected[0, 0].item(), sign * 12)
+                        torch.testing.assert_close(plan.replay(), expected, rtol=0, atol=0)
+                finally:
+                    plan.reset()
+
+    @patch.dict(os.environ, SGLANG_NPU_WELMV4_MK_PAGE_ATTENTION="0")
     def test_embedding_and_projection_rows(self):
         import torch.nn.functional as F
         from megakernel._fixed import capture_fixed
@@ -114,7 +152,9 @@ class WelmModelRowsTest(unittest.TestCase):
                 plan = capture_fixed(forward, build, tile_chains=True)
                 try:
                     names = [name for scope in plan.plans for name in scope.kernel_names]
-                    self.assertEqual(names.count("_welm_row_projection"), 2, names)
+                    self.assertEqual(names.count("_welm_row_projection"), 1, names)
+                    self.assertEqual(names.count("_welm_o_projection_partials"), 1, names)
+                    self.assertEqual(names.count("_welm_o_projection_merge"), 1, names)
                     self.assertEqual(names.count("_welm_base_lookup"), 1, names)
                     self.assertEqual(names.count("_welm_embedding_mean"), 1, names)
                     scopes = [s for s in plan.plans if "_welm_embedding_mean" in s.kernel_names]
