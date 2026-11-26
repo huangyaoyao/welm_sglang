@@ -2682,9 +2682,10 @@ def welmv4_oe_concat_4way(outputs):
     """Concatenate the four dense BF16 OE lookup rows during MK decode."""
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
         welm_decode_tiles_active,
+        welm_native_region_active,
     )
 
-    if welm_decode_tiles_active() and len(outputs) == 4:
+    if (welm_decode_tiles_active() or welm_native_region_active("oe")) and len(outputs) == 4:
         import torch_npu
 
         first = outputs[0]

@@ -25,6 +25,7 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         ):
             raise ValueError("megakernel-native requires a WeLMV4 target or draft")
 
+        import torch
         from megakernel._failure import retain_if_failed
         from megakernel._launch_capture import _library
         from megakernel._runtime import _HOME
@@ -44,6 +45,11 @@ class WelmNativeBackend(BaseCudaGraphBackend):
             and model_runner.spec_algorithm.is_none()
             and (args.tp_size, args.dp_size, args.ep_size, args.pp_size) == (1, 1, 1, 1)
             and self.device.get_device_name().startswith("Ascend950")
+        )
+        config = model_runner.model_config
+        self._native_region_worker = (
+            self._single_pk_worker and getattr(config, "quantization", None) is None
+            and getattr(config, "dtype", None) is not None and config.dtype == torch.bfloat16
         )
         self.tp_group = model_runner.tp_group
         # Descriptor exports and compiler diagnostics are local to a worker.
@@ -84,8 +90,11 @@ class WelmNativeBackend(BaseCudaGraphBackend):
             and (native_ops_only or os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "0")
             and "retain_intermediates" in signature(capture_fixed).parameters
         )
-        with decode_tile_scope(single_pk=retain_intermediates and not native_ops_only,
-                               native_ops_only=native_ops_only):
+        with decode_tile_scope(
+            single_pk=retain_intermediates and not native_ops_only,
+            native_ops_only=native_ops_only,
+            batch=getattr(shape_key, "size", None) if self._native_region_worker else None,
+        ):
             for _ in range(2):
                 self.device.synchronize()
                 self.tp_group.barrier()

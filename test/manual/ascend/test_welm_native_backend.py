@@ -41,7 +41,7 @@ class WelmNativeBackendTest(unittest.TestCase):
         self.capture = Mock(return_value=self.plan)
         self.retain_if_failed = Mock(return_value=False)
         modules = {
-            "torch": SimpleNamespace(Tensor=object),
+            "torch": SimpleNamespace(Tensor=object, bfloat16="bf16"),
             "megakernel._failure": SimpleNamespace(retain_if_failed=self.retain_if_failed),
             "megakernel._runtime": SimpleNamespace(_HOME=directory),
             "megakernel._launch_capture": SimpleNamespace(_library=lambda: None),
@@ -67,7 +67,7 @@ class WelmNativeBackendTest(unittest.TestCase):
         ).WelmNativeBackend
 
     def runner(self, arch):
-        config = SimpleNamespace(hf_config=SimpleNamespace(architectures=[arch]))
+        config = SimpleNamespace(hf_config=SimpleNamespace(architectures=[arch]), dtype="bf16", quantization=None)
         return SimpleNamespace(
             model_runner=SimpleNamespace(
                 model_config=config, tp_group=Mock(), is_draft_worker=False,
@@ -224,6 +224,14 @@ class WelmNativeBackendTest(unittest.TestCase):
                                         for entry in logs.output), logs.output)
                     self.assertFalse(layouts.welm_original_kernels_active())
                     self.assertFalse(layouts.welm_native_gate_first_active())
+
+    def test_candidate_regions_exclude_quantized_and_fp16_dtypes(self):
+        for dtype, quant, expected in (("bf16", None, True), ("fp16", None, False), ("bf16", "fp8", False)):
+            with self.subTest(dtype=dtype, quant=quant):
+                runner = self.runner("WeLMV4MoeForCausalLM")
+                runner.model_runner.model_config.dtype = dtype
+                runner.model_runner.model_config.quantization = quant
+                self.assertEqual(self.backend_cls(runner)._native_region_worker, expected)
 
     def test_reject_unrelated_model(self):
         with self.assertRaisesRegex(ValueError, "WeLMV4"):

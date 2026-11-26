@@ -1,15 +1,17 @@
 """Native tile contracts for the original WeLM decode Triton programs."""
 
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
 
 _ORIGINAL_KERNELS_ONLY = object()
+_native_regions = ContextVar("welm_native_decode_regions", default=frozenset())
 _decode_active = ContextVar("welm_native_decode_tiles", default=None)
 
 
 @contextmanager
-def decode_tile_scope(*, single_pk=False, native_ops_only=False):
+def decode_tile_scope(*, single_pk=False, native_ops_only=False, batch=None):
     from sglang.srt.utils import get_bool_env_var
 
     if native_ops_only:
@@ -20,11 +22,31 @@ def decode_tile_scope(*, single_pk=False, native_ops_only=False):
             workspace["model_row_tiles"] = True
         if get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES"):
             workspace["page_attention_output"] = None
+    regions = set()
+    if (native_ops_only and batch in (1, 2, 4, 8)
+            and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "1"):
+        requested = os.environ.get("SGLANG_NPU_WELMV4_MK_NATIVE_REGIONS", "")
+        regions.update(name.strip() for name in requested.split(",") if name.strip())
+        if regions - {"pages", "oe", "metadata"}:
+            raise ValueError(f"Unknown WeLM native region option(s): {requested!r}")
+        # Hoisting is useful only with the MK-owned AICPU command recorder.
+        if "metadata" in regions:
+            from megakernel import _fixed
+
+            if (os.environ.get("MK_FIXED_NATIVE_FLASH_METADATA") != "1"
+                    or not getattr(_fixed, "SUPPORTS_WELM_DECODE_FLASH_METADATA", False)):
+                regions.discard("metadata")
+    region_token = _native_regions.set(frozenset(regions))
     token = _decode_active.set(workspace)
     try:
         yield
     finally:
         _decode_active.reset(token)
+        _native_regions.reset(region_token)
+
+
+def welm_native_region_active(name):
+    return name in _native_regions.get()
 
 
 def welm_original_kernels_active():

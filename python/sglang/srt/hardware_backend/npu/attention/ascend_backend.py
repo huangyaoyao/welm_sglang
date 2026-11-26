@@ -662,6 +662,8 @@ class AscendAttnBackend(AttentionBackend):
         valid_rows: torch.Tensor,
         page_starts: torch.Tensor,
         page_in_bounds: torch.Tensor,
+        *,
+        page_divisor: Optional[torch.Tensor] = None,
     ) -> None:
         """Gather Full/SWA page heads into fixed graph-owned output tables."""
         valid_pages = valid_rows[:, None] & (page_starts < seq_lens[:, None])
@@ -675,15 +677,25 @@ class AscendAttnBackend(AttentionBackend):
         full_page_locs = torch.where(
             valid_pages, self.req_to_token[req_indices, token_indices], 0
         )
-        metadata.block_tables.copy_(full_page_locs // self.page_size)
+        def write_page_ids(locs, table):
+            # The locations are fresh gather/where outputs; the tables are
+            # distinct fixed graph inputs. An out variant preserves their address.
+            if (page_divisor is not None and locs.device.type == "npu"
+                    and locs.device == table.device and locs.dtype == table.dtype == torch.int32
+                    and locs.shape == table.shape and locs.is_contiguous() and table.is_contiguous()
+                    and torch_npu.get_npu_format(locs) in (0, 2)
+                    and torch_npu.get_npu_format(table) in (0, 2)):
+                torch.ops.aten.floor_divide.out(locs, page_divisor, out=table)
+            else:
+                table.copy_(locs // self.page_size)
+
+        write_page_ids(full_page_locs, metadata.block_tables)
         if self.is_hybrid_swa:
             # Reuse upstream's page-head gather -> SWA mapping order. Full and
             # SWA share the gather; never materialize a B x context token map.
             # Floor division preserves the existing negative sentinel semantics.
             swa_page_locs = self.full_to_swa_index_mapping[full_page_locs]
-            metadata.block_tables_swa.copy_(
-                torch.where(valid_pages, swa_page_locs, 0) // self.page_size
-            )
+            write_page_ids(torch.where(valid_pages, swa_page_locs, 0), metadata.block_tables_swa)
 
     def write_welm_prefill_graph_kv(self, layer, k, v, full_locs, swa_locs) -> None:
         """Fixed-row BF16 cache write for this graph path only.
@@ -758,11 +770,7 @@ class AscendAttnBackend(AttentionBackend):
         # The metadata and attention calls must agree on every scheduling
         # attribute. Physical offsets cover all graph rows; used lengths can
         # be zero for padding, whose output is initialized by FlashAttn itself.
-        common = dict(
-            cu_seqlens_q=cu_q,
-            cu_seqlens_kv=None,
-            seqused_q=q_lens,
-            seqused_kv=kv_lens,
+        schedule_attrs = dict(
             max_seqlen_q=max_q,
             max_seqlen_kv=-1,
             mask_mode=4 if is_swa else 3,
@@ -772,30 +780,18 @@ class AscendAttnBackend(AttentionBackend):
             layout_kv="PA_BBND",
             layout_out="TND",
         )
-        # Lengths/batch/device are fixed within this ForwardMetadata and Q
-        # family. KV cache addresses, layer IDs and sink values do not affect
-        # scheduling. Mirror consumers must not reuse the source's multi-Q plan.
-        schedule_key = (
-            mirror_prefill,
-            layer.tp_q_head_num,
-            layer.tp_k_head_num,
-            layer.qk_head_dim,
-            common["mask_mode"],
-            common["win_left"],
-            common["win_right"],
-            common["layout_q"],
-            common["layout_kv"],
-            common["layout_out"],
-            common["max_seqlen_q"],
-            common["max_seqlen_kv"],
+        common = dict(
+            cu_seqlens_q=cu_q, cu_seqlens_kv=None, seqused_q=q_lens,
+            seqused_kv=kv_lens, **schedule_attrs,
         )
+        # Cache only static geometry in the key. In particular the key carries
+        # neither a device pointer nor any used-length values from a warmup.
+        heads = (layer.tp_q_head_num, layer.tp_k_head_num, layer.qk_head_dim)
+        schedule_key = (mirror_prefill, heads, tuple(schedule_attrs.items()))
         schedule = metadata.welm_flash_schedules.get(schedule_key)
         if schedule is None:
             schedule = self._welm_flash_attn_metadata(
-                layer.tp_q_head_num,
-                layer.tp_k_head_num,
-                layer.qk_head_dim,
-                **common,
+                *heads, **common,
             )
             metadata.welm_flash_schedules[schedule_key] = schedule
         output, _ = self._welm_flash_attn(
@@ -1466,37 +1462,93 @@ class AscendAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        if self.forward_metadata.welm_decode_metadata_in_graph:
-            self._prepare_welm_decode_metadata_device(forward_batch)
+        metadata = self.forward_metadata
+        previous_geometries = ()
         if self.use_welm_flash_attn:
-            # run_once invokes this for each warmup AND the actual capture.
-            # Capture must record fresh producers, not reuse warmup schedules.
-            self.forward_metadata.welm_flash_schedules.clear()
-            self.forward_metadata.welm_flash_mirror_q_lengths = None
+            if metadata.welm_decode_metadata_in_graph:
+                from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+                    welm_native_region_active,
+                )
+
+                if welm_native_region_active("metadata"):
+                    previous_geometries = tuple(metadata.welm_flash_schedules)
+            # Each capture pass and replay need the schedule for their own inputs.
+            metadata.welm_flash_schedules.clear()
+            metadata.welm_flash_mirror_q_lengths = None
+        if metadata.welm_decode_metadata_in_graph:
+            self._prepare_welm_decode_metadata_device(forward_batch, previous_geometries)
+
+    def _prime_welm_decode_flash_schedules(self, metadata, seq_lens, geometries):
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_flash_metadata import (
+            can_record_decode_metadata,
+        )
+
+        cu = metadata.welm_flash_cu_seqlens_q
+        used_q = metadata.welm_flash_seqused_q
+        used_kv = metadata.welm_flash_seqused_kv
+        if not can_record_decode_metadata(seq_lens, cu, used_q, used_kv):
+            return False
+        prepared_lengths = False
+        for key in geometries:
+            mirror, heads, items = key
+            attrs = dict(items)
+            if (mirror or attrs["max_seqlen_q"] != 1 or attrs["max_seqlen_kv"] != -1
+                    or (attrs["layout_q"], attrs["layout_kv"], attrs["layout_out"])
+                    != ("TND", "PA_BBND", "TND")):
+                continue
+            if not prepared_lengths:
+                schedule = torch.ops.sglang.welm_decode_flash_metadata.default(
+                    seq_lens, cu, used_q, used_kv, *heads, attrs["max_seqlen_q"],
+                    attrs["max_seqlen_kv"], attrs["mask_mode"], attrs["win_left"], attrs["win_right"],
+                )
+                prepared_lengths = True
+            else:
+                schedule = self._welm_flash_attn_metadata(
+                    *heads, cu_seqlens_q=cu, cu_seqlens_kv=None,
+                    seqused_q=used_q, seqused_kv=used_kv, **attrs,
+                )
+            metadata.welm_flash_schedules[key] = schedule
+        return prepared_lengths
 
     def _prepare_welm_decode_metadata_device(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, previous_geometries=(),
     ) -> None:
         """Capture ordinary decode metadata from fixed registry input buffers."""
+        from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+            welm_decode_tiles_active,
+            welm_native_region_active,
+        )
+
         metadata = self.forward_metadata
         seq_lens = forward_batch.seq_lens
-        if self.page_size == 64:
-            from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
-                welm_decode_tiles_active,
-            )
+        if self.page_size == 64 and welm_decode_tiles_active():
+            from sglang.srt.hardware_backend.npu.graph_runner.welm_paged_kv import prepare_flash_pages
 
-            if welm_decode_tiles_active():
-                from sglang.srt.hardware_backend.npu.graph_runner.welm_paged_kv import prepare_flash_pages
-
-                if prepare_flash_pages(
-                    self.req_to_token, forward_batch.req_pool_indices, seq_lens,
-                    forward_batch.out_cache_loc, metadata.block_tables,
-                    metadata.welm_flash_seqused_q, metadata.welm_flash_seqused_kv,
-                    self.full_to_swa_index_mapping if self.is_hybrid_swa else None,
-                    metadata.block_tables_swa, metadata.swa_out_cache_loc,
-                ):
-                    return
+            if prepare_flash_pages(
+                self.req_to_token, forward_batch.req_pool_indices, seq_lens,
+                forward_batch.out_cache_loc, metadata.block_tables,
+                metadata.welm_flash_seqused_q, metadata.welm_flash_seqused_kv,
+                self.full_to_swa_index_mapping if self.is_hybrid_swa else None,
+                metadata.block_tables_swa, metadata.swa_out_cache_loc,
+            ):
+                return
+        # The first recorded original metadata command also updates the two
+        # length buffers. The following separate page mask is deliberately
+        # created only after all AICPU schedules have been submitted.
+        lengths_ready = bool(previous_geometries) and self._prime_welm_decode_flash_schedules(
+            metadata, seq_lens, previous_geometries
+        )
         valid_rows = seq_lens > 0
+        divisor = None
+        if welm_native_region_active("pages"):
+            # op-plugin registers the Tensor out overload. The fixed CPU scalar
+            # takes its aclnnFloorDivides path, as the original scalar division
+            # does. Allocate once during warmup, outside the recorded command.
+            if "welm_page_divisor" not in self.graph_metadata:
+                self.graph_metadata["welm_page_divisor"] = torch.tensor(
+                    self.page_size, dtype=torch.int32, device="cpu"
+                )
+            divisor = self.graph_metadata["welm_page_divisor"]
         self._prepare_welm_graph_page_tables_device(
             metadata,
             forward_batch.req_pool_indices,
@@ -1504,6 +1556,7 @@ class AscendAttnBackend(AttentionBackend):
             valid_rows,
             self.graph_metadata["welm_decode_page_starts"],
             self.graph_metadata["welm_decode_page_in_bounds"],
+            page_divisor=divisor,
         )
 
         if metadata.swa_out_cache_loc is not None:
@@ -1517,8 +1570,9 @@ class AscendAttnBackend(AttentionBackend):
 
         # seq_lens already aliases the registry input; no self-copy is needed.
         # cu_seqlens_q and max_seqlen_q are capture-bucket constants (one Q/row).
-        metadata.welm_flash_seqused_q.copy_(valid_rows)
-        metadata.welm_flash_seqused_kv.copy_(torch.where(valid_rows, seq_lens, 0))
+        if not lengths_ready:
+            metadata.welm_flash_seqused_q.copy_(valid_rows)
+            metadata.welm_flash_seqused_kv.copy_(torch.where(valid_rows, seq_lens, 0))
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
