@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 class _A5Test(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, SGLANG_NPU_WELMV4_MK_CUBE_PAGE_ATTENTION="0"))
         try:
             import torch
             import torch_npu

@@ -6,9 +6,10 @@ import triton
 import triton.language as tl
 
 from megakernel.triton import native
+from sglang.srt.utils import get_bool_env_var
 
 from .welm_paged_kv import _validated_page_group, _write_grouped_kv
-from .welm_tile_layouts import record_page_attention_output, welm_decode_tiles_active
+from .welm_tile_layouts import record_page_attention_output, welm_decode_tiles_active, welm_model_row_tiles_active
 
 
 def _partial_layout(q, keys, values, table, lengths, partials, rows, pages, group,
@@ -136,6 +137,12 @@ def try_page_attention(q, k, v, slots, keys, values, table, lengths, sinks, wind
     group = _validated_page_group(k, v, slots, keys, values, table, lengths)
     if group is None:
         return None
+    if welm_model_row_tiles_active() and get_bool_env_var("SGLANG_NPU_WELMV4_MK_CUBE_PAGE_ATTENTION"):
+        from .welm_page_cube_attention import run_page_cube_attention
+
+        return run_page_cube_attention(q, k, v, slots, keys, values, table, lengths, sinks, window,
+                                       scale, workspace, group)
+
     pages = keys.shape[0]
     groups = triton.cdiv(pages, group)
     # All allocations precede mutation of persistent KV. Allocate flat ND

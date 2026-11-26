@@ -29,6 +29,7 @@ class WelmPageGateLayerTest(unittest.TestCase):
             "SGLANG_NPU_USE_SCATTER_PA_KV_CACHE": "1",
             "WELM_NPU_USE_FLASH_ATTN": "1",
             "SGLANG_NPU_WELMV4_MK_PAGE_ATTENTION": "1",
+            "SGLANG_NPU_WELMV4_MK_CUBE_PAGE_ATTENTION": "0",
             GATE_FLAG: "1",
             LEGACY_FUSE_GATE_FLAG: "0",
             "SGLANG_NPU_WELMV4_MK_BF16_QKV": "1",
