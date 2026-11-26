@@ -5,16 +5,30 @@ import torch_npu
 
 
 def can_record_decode_metadata(seq_lens, cu_q, used_q, used_kv):
-    batch = seq_lens.numel()
     tensors = (seq_lens, cu_q, used_q, used_kv)
+    if not all(isinstance(t, torch.Tensor) for t in tensors):
+        return False
+    batch = seq_lens.numel()
     if (batch not in (1, 2, 4, 8) or seq_lens.device.type != "npu"
             or seq_lens.dtype not in (torch.int32, torch.int64)
-            or any(t.dtype != torch.int32 for t in tensors[1:])
-            or any(t.device != seq_lens.device or t.shape != (size,)
-                   or not t.is_contiguous() or torch_npu.get_npu_format(t) not in (0, 2)
-                   for t, size in zip(tensors, (batch, batch + 1, batch, batch)))):
+            or any(t.dtype != torch.int32 for t in tensors[1:])):
         return False
-    spans = sorted((t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in tensors)
+    spans = []
+    for tensor, size in zip(tensors, (batch, batch + 1, batch, batch)):
+        # A one-element slice with stride > 1 is still contiguous to Torch.
+        # The MK fixed descriptor requires exactly the dense 1-D stride.
+        if (tensor.shape != (size,) or tensor.stride() != (1,)
+                or tensor.layout != torch.strided or tensor.device != seq_lens.device
+                or tensor.is_conj() or tensor.is_neg()
+                or torch_npu.get_npu_format(tensor) not in (0, 2)):
+            return False
+        storage = tensor.untyped_storage()
+        begin = tensor.data_ptr()
+        end = begin + size * tensor.element_size()
+        if not storage.data_ptr() <= begin < end <= storage.data_ptr() + storage.nbytes():
+            return False
+        spans.append((begin, end))
+    spans.sort()
     return all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
 
 

@@ -106,13 +106,15 @@ class NativeRegionsTest(unittest.TestCase):
     def test_metadata_buffer_contract_rejects_aliases_layouts_and_dtypes(self):
         from test_welmv4_prefill_graph_contracts import load_nodes
         device = types.SimpleNamespace(type="npu")
-        torch = types.SimpleNamespace(int32="i32", int64="i64")
+        torch = types.SimpleNamespace(int32="i32", int64="i64", Tensor=types.SimpleNamespace, strided="strided")
         fn = load_nodes(DIR / "welm_flash_metadata.py", ["can_record_decode_metadata"], {
             "torch": torch, "torch_npu": types.SimpleNamespace(get_npu_format=lambda t: t.fmt),
         })["can_record_decode_metadata"]
         def fixed(size, start, dtype="i32"):
             return types.SimpleNamespace(numel=lambda: size, shape=(size,), dtype=dtype, device=device,
-                                         is_contiguous=lambda: True, fmt=2, data_ptr=lambda: start,
+                                         stride=lambda: (1,), layout="strided", is_neg=lambda: False,
+                                         is_conj=lambda: False, fmt=2, data_ptr=lambda: start,
+                                         untyped_storage=lambda: types.SimpleNamespace(data_ptr=lambda: start, nbytes=lambda: 512),
                                          element_size=lambda: 4 if dtype == "i32" else 8)
         for batch in (1, 2, 4, 8):
             args = [fixed(batch, 100, "i64"), fixed(batch + 1, 512), fixed(batch, 768), fixed(batch, 1024)]
@@ -124,6 +126,10 @@ class NativeRegionsTest(unittest.TestCase):
                 self.assertFalse(fn(*changed))
             args[1].fmt = 29
             self.assertFalse(fn(*args))
+        singleton = [fixed(1, 100), fixed(2, 200), fixed(1, 300), fixed(1, 400)]
+        singleton[0].stride = lambda: (2,)
+        self.assertFalse(fn(*singleton))
+        self.assertFalse(fn(singleton[0], None, singleton[2], singleton[3]))
 
     def test_full_swa_metadata_uses_this_replays_lengths_before_pages(self):
         import numpy as np

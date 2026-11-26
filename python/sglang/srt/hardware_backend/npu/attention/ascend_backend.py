@@ -1492,7 +1492,10 @@ class AscendAttnBackend(AttentionBackend):
         for key in geometries:
             mirror, heads, items = key
             attrs = dict(items)
-            if (mirror or attrs["max_seqlen_q"] != 1 or attrs["max_seqlen_kv"] != -1
+            mask, left, right = attrs["mask_mode"], attrs["win_left"], attrs["win_right"]
+            if (mirror or min(heads) < 1 or heads[0] % heads[1] != 0
+                    or not ((mask, left, right) == (3, -1, -1) or (mask == 4 and left >= 0 and right == 0))
+                    or attrs["max_seqlen_q"] != 1 or attrs["max_seqlen_kv"] != -1
                     or (attrs["layout_q"], attrs["layout_kv"], attrs["layout_out"])
                     != ("TND", "PA_BBND", "TND")):
                 continue

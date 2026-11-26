@@ -1,5 +1,6 @@
 """Single-plan A5 probe of production decode boundaries. Run once per --batch."""
 import argparse
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,6 +80,8 @@ def run(batch, directory):
     with torch.inference_mode():
         with decode_tile_scope(native_ops_only=True, batch=batch):
             regions = {r for r in ("metadata", "pages", "oe") if welm_native_region_active(r)}
+            requested = {r.strip() for r in os.environ.get("SGLANG_NPU_WELMV4_MK_NATIVE_REGIONS", "").split(",") if r.strip()}
+            assert regions == requested, f"Requested {sorted(requested)} but only {sorted(regions)} activated"
             fn = lambda: forward(candidate)
             for _ in range(2):
                 fn()
@@ -94,8 +97,20 @@ def run(batch, directory):
             print("regions", sorted(regions), "physical_scopes", plan.scope_count, flush=True)
             print("execution", plan.execution_summary, flush=True)
             names = [n for p in plan.plans for n in p.kernel_names]
+            if "pages" in regions:
+                full_ptr = candidate.forward_metadata.block_tables.data_ptr()
+                out_count = 0
+                for call in plan.graph.calls:
+                    if str(call.function) == "aten.floor_divide.out":
+                        _, kwargs = plan.graph.decode((call.args, call.kwargs), plan.graph.values)
+                        out_count += int(kwargs["out"].data_ptr() == full_ptr)
+                    if str(call.function) == "aten.copy_.default":
+                        args = plan.graph.decode(call.args, plan.graph.values)
+                        assert args[0].data_ptr() != full_ptr, "extra copy to the persistent Full page table"
+                assert out_count == 1, f"expected one direct Full page writer, got {out_count}"
             if "oe" in regions:
-                assert any("_welmv4_oe_concat_4way_kernel" in name for name in names), names
+                assert sum("_welmv4_oe_concat_4way_kernel" in name for name in names) == 1, names
+                assert "aten.cat.default" not in originals, originals
             if "metadata" in regions:
                 recorded = {r["operation"]: r["calls"] for r in plan.execution_summary["recorded_native_steps"]}
                 assert recorded.get("sglang.welm_decode_flash_metadata.default") == 1, recorded
