@@ -233,6 +233,46 @@ class WelmNativeBackendTest(unittest.TestCase):
                 runner.model_runner.model_config.quantization = quant
                 self.assertEqual(self.backend_cls(runner)._native_region_worker, expected)
 
+    def test_fixed_scratch_shared_only_by_plain_single_card_native_fine_buckets(self):
+        class Key:
+            stream_idx = None
+            def __init__(self, size):
+                self.size = size
+
+        class Pool:
+            capture_session = staticmethod(nullcontext)
+
+        captures = []
+        def capture(fn, directory, *, prepared, tile_chains, retain_intermediates=False, workspace_pool=None):
+            captures.append(workspace_pool)
+            return self.plan
+
+        sys.modules["megakernel._fixed"].capture_fixed = capture
+        settings = {"SGLANG_NPU_WELMV4_MK_SHARE_DECODE_WORKSPACE": "1",
+                    "SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY": "1", "MK_NATIVE_TILE_DEPENDENCIES": "1"}
+        with patch.dict(os.environ, settings), patch.dict(sys.modules, {
+            "megakernel._workspace_pool": SimpleNamespace(FixedWorkspacePool=Pool),
+        }):
+            runner = self.runner("WeLMV4MoeForCausalLM")
+            backend = self.backend_cls(runner)
+            for batch in (8, 4, 2, 1, 3):
+                backend.capture_one(Key(batch), lambda: None)
+            self.assertIsNotNone(captures[0])
+            self.assertTrue(all(p is captures[0] for p in captures[:4]))
+            self.assertIsNone(captures[-1])
+            stream_key = Key(4)
+            stream_key.stream_idx = 1
+            backend.capture_one(stream_key, lambda: None)
+            self.assertIsNone(captures[-1])
+            with patch.dict(os.environ, {"MK_NATIVE_TILE_DEPENDENCIES": "0"}):
+                backend.capture_one(Key(2), lambda: None)
+                self.assertIsNone(captures[-1])
+            runner.enable_pdmux = True
+            self.backend_cls(runner).capture_one(Key(1), lambda: None)
+            self.assertIsNone(captures[-1])
+            backend.cleanup()
+            self.assertIsNot(backend._workspace_pool, captures[0])
+
     def test_reject_unrelated_model(self):
         with self.assertRaisesRegex(ValueError, "WeLMV4"):
             self.backend_cls(self.runner("OtherForCausalLM"))

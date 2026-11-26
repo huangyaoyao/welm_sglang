@@ -51,6 +51,16 @@ class WelmNativeBackend(BaseCudaGraphBackend):
             self._single_pk_worker and getattr(config, "quantization", None) is None
             and getattr(config, "dtype", None) is not None and config.dtype == torch.bfloat16
         )
+        self._workspace_pool_factory = None
+        self._workspace_pool = None
+        if (
+            self._native_region_worker and not getattr(runner, "enable_pdmux", False)
+            and os.environ.get("SGLANG_NPU_WELMV4_MK_SHARE_DECODE_WORKSPACE") == "1"
+        ):
+            from megakernel._workspace_pool import FixedWorkspacePool
+
+            self._workspace_pool_factory = FixedWorkspacePool
+            self._workspace_pool = FixedWorkspacePool()
         self.tp_group = model_runner.tp_group
         # Descriptor exports and compiler diagnostics are local to a worker.
         self.directory = Path(_HOME) / "sglang_native_compile" / str(os.getpid())
@@ -90,7 +100,12 @@ class WelmNativeBackend(BaseCudaGraphBackend):
             and (native_ops_only or os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "0")
             and "retain_intermediates" in signature(capture_fixed).parameters
         )
-        with decode_tile_scope(
+        pool = None
+        if (self._workspace_pool is not None and native_ops_only and retain_intermediates
+                and getattr(shape_key, "stream_idx", None) is None
+                and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "1"):
+            pool = self._workspace_pool
+        with (pool.capture_session() if pool is not None else nullcontext()), decode_tile_scope(
             single_pk=retain_intermediates and not native_ops_only,
             native_ops_only=native_ops_only,
             batch=getattr(shape_key, "size", None) if self._native_region_worker else None,
@@ -115,6 +130,8 @@ class WelmNativeBackend(BaseCudaGraphBackend):
             self.tp_group.barrier()
             try:
                 opts = {"retain_intermediates": True} if retain_intermediates else {}
+                if pool is not None:
+                    opts["workspace_pool"] = pool
                 plan = capture_fixed(forward_fn, directory, prepared=True, tile_chains=True, **opts)
             except BaseException:
                 # These caller-owned buffers may still be in flight before a plan
@@ -207,3 +224,5 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         for plan, _ in self._plans.values():
             plan.reset()
         self._plans.clear()
+        if self._workspace_pool_factory is not None:
+            self._workspace_pool = self._workspace_pool_factory()
