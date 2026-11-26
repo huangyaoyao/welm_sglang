@@ -12,7 +12,7 @@ KEY = re.compile(r"WeLM MK capture ShapeKey\(size=(\d+), stream_idx=None, varian
 COUNTS = re.compile(
     r": (\d+) kernels, (\d+) scopes, (\d+) fused kernels, (\d+) Torch boundaries, (\d+) tile edges"
 )
-SCOPE = re.compile(r" scope (\d+) (kernels|tile edges) (.+)")
+SCOPE = re.compile(r" scope (\d+) (kernels|tile edges|indexed dependencies) (.+)")
 FLASH = "static_kernel_FlashAttn_"
 SCATTER = "static_kernel_ScatterPaKvCache_"
 GATE = "sigmoid_mul_kernel_npu"
@@ -49,7 +49,7 @@ def read_captures(lines, buckets):
         if counts:
             if bs in captures:
                 raise ValueError(f"bs={bs} has multiple captures; supply one run per log")
-            captures[bs] = dict(counts=tuple(map(int, counts.groups())), kernels={}, edges={}, coarse_edges={})
+            captures[bs] = dict(counts=tuple(map(int, counts.groups())), kernels={}, edges={}, coarse_edges={}, indexed={})
             continue
         try:
             cap = captures[bs]
@@ -67,6 +67,8 @@ def read_captures(lines, buckets):
                     dest, value = cap["kernels"], _literal(names)
                     if not isinstance(value, tuple) or not all(isinstance(k, str) for k in value):
                         raise ValueError("expected tuple of kernel names")
+                elif kind == "indexed dependencies":
+                    dest, value = cap["indexed"], _literal(value)
                 else:
                     dest, value = cap["edges"], _literal(value)
                     if not isinstance(value, list) or not all(
@@ -101,26 +103,51 @@ def read_captures(lines, buckets):
                     for pair in pairs
                 ):
                     raise ValueError(f"bs={bs} scope {i} has invalid {kind} or unknown kernels")
+        for i, records in cap["indexed"].items():
+            if i not in kernels or not isinstance(records, list):
+                raise ValueError(f"bs={bs} invalid indexed scope {i}")
+            found = {"tile": Counter(), "full": Counter()}
+            seen = set()
+            for item in records:
+                if not isinstance(item, tuple) or len(item) != 4:
+                    raise ValueError(f"bs={bs} invalid indexed dependency in scope {i}")
+                src, dst, kind, origin = item
+                if (type(src) is not int or type(dst) is not int or not 0 <= src < dst < len(kernels[i])
+                        or (src, dst) in seen or kind not in found or origin not in ("storage", "stream")):
+                    raise ValueError(f"bs={bs} invalid indexed dependency in scope {i}")
+                seen.add((src, dst))
+                found[kind][kernels[i][src], kernels[i][dst]] += 1
+            if found["tile"] != Counter(edges.get(i, ())) or found["full"] != Counter(cap["coarse_edges"][i]):
+                raise ValueError(f"bs={bs} indexed dependencies disagree with named edges in scope {i}")
         if sum(row["calls"] for row in cap["boundaries"]["torch_boundaries"]) != boundaries:
             raise ValueError(f"bs={bs} boundary details differ from capture totals")
     return captures
 
 
 def _flash_chains(cap, edge_key):
-    """Name-only logs identify a Flash instance by (scope, unique kernel name)."""
+    """Count both sides of the same Flash instance in a captured scope."""
     both = scatter_in = gate_out = native_chains = 0
     for scope, kernels in cap["kernels"].items():
-        counts = Counter(kernels)
-        pairs = cap[edge_key].get(scope, ())
+        if scope in cap["indexed"]:
+            kind = "tile" if edge_key == "edges" else "full"
+            pairs = [(src, dst) for src, dst, wait, _ in cap["indexed"][scope] if wait == kind]
+            flashes = {i for i, name in enumerate(kernels) if name.startswith(FLASH)}
+            name_at = kernels.__getitem__
+        else:
+            # Legacy logs only identify kernels by name. Multiple occurrences
+            # of one specialization in a scope cannot establish a two-sided chain.
+            counts = Counter(kernels)
+            pairs = cap[edge_key].get(scope, ())
+            flashes = {k for k, n in counts.items() if n == 1 and k.startswith(FLASH)}
+            name_at = str
         inputs = {dst for src, dst in pairs if src != dst}
         outputs = {src for src, dst in pairs if src != dst}
-        from_scatter = {dst for src, dst in pairs if src.startswith(SCATTER)}
-        to_gate = {src for src, dst in pairs if dst == GATE}
-        unique = {name for name, n in counts.items() if n == 1 and name.startswith(FLASH)}
-        both += len(unique & inputs & outputs)
-        scatter_in += len(unique & from_scatter)
-        gate_out += len(unique & to_gate)
-        native_chains += len(unique & from_scatter & to_gate)
+        from_scatter = {dst for src, dst in pairs if name_at(src).startswith(SCATTER)}
+        to_gate = {src for src, dst in pairs if name_at(dst) == GATE}
+        both += len(flashes & inputs & outputs)
+        scatter_in += len(flashes & from_scatter)
+        gate_out += len(flashes & to_gate)
+        native_chains += len(flashes & from_scatter & to_gate)
     return dict(two_sided=both, scatter_inputs=scatter_in, gate_outputs=gate_out,
                 scatter_flash_gate=native_chains)
 
@@ -151,7 +178,18 @@ def summarize(cap):
         len(group) == 3 and group[0].startswith(SCATTER) and group[1].startswith(FLASH) and group[2] == GATE
         for group in cap["kernels"].values()
     )
+    def family(name):
+        return name.split("_", 3)[2] if name.startswith("static_kernel_") else name
+
+    dependency_counts = Counter()
+    for scope, records in cap["indexed"].items():
+        group = cap["kernels"][scope]
+        for src, dst, kind, origin in records:
+            dependency_counts[(family(group[src]), family(group[dst]), kind, origin)] += 1
+    inventory = [dict(producer=src, consumer=dst, wait=kind, origin=origin, count=count)
+                 for (src, dst, kind, origin), count in sorted(dependency_counts.items())]
     return dict(kernels=kernels, scopes=scopes, fused=fused, torch_boundaries=boundaries,
+                indexed_scopes=len(cap["indexed"]), dependency_inventory=inventory,
                 exclusive_scatter_flash_gate_scopes=exclusive,
                 coarse_flash_chains=_flash_chains(cap, "coarse_edges"),
                 tile_flash_chains=_flash_chains(cap, "edges"),

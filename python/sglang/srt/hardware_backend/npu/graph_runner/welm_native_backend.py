@@ -157,6 +157,17 @@ class WelmNativeBackend(BaseCudaGraphBackend):
                     "WeLM MK capture %s scope %d kernels %s coarse edges %s tile ratios %s",
                     shape_key, index, scope.kernel_names, coarse, scope.tile_dependency_ratios,
                 )
+                memory = getattr(scope, "memory_dependencies", None)
+                if isinstance(memory, (tuple, list)) and len(memory) == len(scope.dependencies):
+                    # Scope-local IDs identify repeated instances of the same kernel.
+                    # A stream-only dependency also constrains legal refinements.
+                    indexed = [
+                        (src, dst, "tile" if (src, dst) in selected else "full",
+                         "storage" if src in memory[dst] else "stream")
+                        for dst, parents in enumerate(scope.dependencies) for src in parents
+                    ]
+                    logger.debug("WeLM MK capture %s scope %d indexed dependencies %s",
+                                 shape_key, index, indexed)
             logger.debug("WeLM MK capture %s boundaries %s", shape_key, plan.execution_summary)
 
     def can_run(self, forward_batch, shape_key):

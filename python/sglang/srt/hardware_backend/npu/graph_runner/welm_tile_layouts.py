@@ -32,6 +32,10 @@ def welm_original_kernels_active():
     return _decode_active.get() is not None
 
 
+def welm_native_ops_only_active():
+    return _decode_active.get() is _ORIGINAL_KERNELS_ONLY
+
+
 def welm_decode_tiles_active():
     return welm_decode_tile_workspace() is not None
 

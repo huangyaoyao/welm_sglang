@@ -71,6 +71,20 @@ class NativeCaptureComparisonTest(unittest.TestCase):
         self.assertTrue(result["errors"])
         self.assertEqual(result["buckets"][1]["fine"]["tile_flash_chains"]["two_sided"], 0)
 
+    def test_repeated_flash_specialization_uses_scope_local_ids(self):
+        names = (SCATTER, FLASH, FLASH, GATE, *FLASHES[2:])
+        edges = [(SCATTER, FLASH), (FLASH, GATE)]
+        lines = scoped_log([(names, (), edges)])
+        prefix = lines[0].split(": ")[0]
+        for flash, count in ((1, 1), (2, 0)):
+            with self.subTest(flash=flash):
+                records = [(0, 1, "tile", "storage"), (flash, 3, "tile", "storage")]
+                fine = lines + [f"{prefix} scope 0 indexed dependencies {records!r}"]
+                result = self.check(log(names), fine, strict=True)
+                stats = result["buckets"][1]["fine"]["tile_flash_chains"]
+                self.assertEqual(stats["scatter_flash_gate"], count)
+                self.assertEqual(bool(result["errors"]), count == 0)
+
     def test_exclusive_and_embedded_chains_count_instances(self):
         native_edges = [(SCATTER, FLASH), (FLASH, GATE)]
         names = (SCATTER, FLASH, GATE)
@@ -83,6 +97,19 @@ class NativeCaptureComparisonTest(unittest.TestCase):
         self.assertEqual(summary["fine"]["exclusive_scatter_flash_gate_scopes"], 1)
         self.assertEqual(summary["coarse"]["coarse_flash_chains"]["scatter_flash_gate"], 2)
         self.assertEqual(summary["fine"]["tile_flash_chains"]["scatter_flash_gate"], 2)
+
+    def test_indexed_edges_match_names_and_keep_repeated_instances(self):
+        names = ("src", "src", FLASH, GATE, *FLASHES[1:])
+        lines = scoped_log([(names, [("src", FLASH)], [(FLASH, GATE)])])
+        prefix = lines[0].split(": ")[0]
+        records = [(1, 2, "full", "stream"), (2, 3, "tile", "storage")]
+        def parse(entries):
+            return read_captures(lines + [f"{prefix} scope 0 indexed dependencies {entries!r}"], [1])
+        cap = parse(records)
+        self.assertEqual(cap[1]["indexed"][0], records)
+        for invalid in (records[1:], records + records[:1], [(4, 2, "full", "stream"), records[1]]):
+            with self.assertRaises(ValueError):
+                parse(invalid)
 
     def test_different_flashes_in_one_scope_cannot_join(self):
         edges = [("kv_write", FLASHES[0]), (FLASHES[1], GATE)]

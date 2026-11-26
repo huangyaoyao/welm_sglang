@@ -2753,6 +2753,26 @@ def welmv4_oe_hash_decode_4way_npu(
     )
     if batch_size == 0:
         return output
+    # One exact-width program writes each plane of the original compact tensor.
+    # Without a masked tail, Triton can compile the original JIT as a SIMD child.
+    from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
+        welm_native_ops_only_active,
+    )
+
+    if (
+        welm_native_ops_only_active()
+        and batch_size in (1, 2, 4, 8)
+        and block_b == 128
+        and input_ids.device.type == "npu"
+        and torch.npu.get_device_name(input_ids.device).startswith("Ascend950")
+        and input_ids.dtype == req_pool_indices.dtype == torch.int64
+        and column_starts.dtype == token_table.dtype == torch.int32
+        and token_table.numel() > 0
+        and all(t.device == input_ids.device and t.is_contiguous()
+                for t in (input_ids, token_table, req_pool_indices, column_starts))
+    ):
+        block_b = batch_size
+        launch_options = dict(PADDED_OUTPUT=True, compile_mode="simd")
     num_tasks = triton.cdiv(batch_size, block_b)
     _welmv4_oe_hash_decode_4way_kernel[
         _welmv4_1d_grid(num_tasks, input_ids.device)
