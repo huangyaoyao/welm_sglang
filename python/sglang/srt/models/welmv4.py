@@ -3144,6 +3144,7 @@ class Qwen2MoeAttention(nn.Module):
                     positions, hidden_states, forward_batch
                 )
         gate = None
+        flash_scope_boundary = None
         if (
             self.supports_mk_page_gate and self.gated_self_attention_headwise
             and fused_qkv is None and forward_batch.welm_prefill_graph is None
@@ -3159,6 +3160,10 @@ class Qwen2MoeAttention(nn.Module):
                 gate_first = (plain_linear(self.gate_proj, ColumnParallelLinear)
                               and self.gate_proj.tp_size == 1 and not self.gate_proj.gather_output
                               and not self.attn._forward_hooks and not self.attn._forward_pre_hooks)
+                if gate_first and get_bool_env_var("SGLANG_NPU_WELMV4_MK_NATIVE_FLASH_SCOPE"):
+                    from megakernel import mark_native_boundary
+
+                    flash_scope_boundary = mark_native_boundary
             if gate_first:
                 # Gate projection only reads hidden_states. Keep its original
                 # matmul ahead of QKV so sigmoid can share Flash's MK scope.
@@ -3491,6 +3496,8 @@ class Qwen2MoeAttention(nn.Module):
                 **attn_kwargs,
             )
         else:
+            if flash_scope_boundary is not None:
+                flash_scope_boundary()
             attn_output = self.attn(
                 q,
                 k,
@@ -3532,6 +3539,8 @@ class Qwen2MoeAttention(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             if _is_npu:
                 inplace_sigmoid_mul_npu(gate, attn_output)
+                if flash_scope_boundary is not None:
+                    flash_scope_boundary()
             else:
                 inplace_sigmoid_mul(gate, attn_output)
             attn_output = attn_output.view(attn_shape)

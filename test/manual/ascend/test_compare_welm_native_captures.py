@@ -4,22 +4,29 @@ from compare_welm_native_captures import compare, read_captures
 
 
 FLASH = "static_kernel_FlashAttn_abcd_123_d0"
-NAMES = ("kv_write",) + (FLASH,) * 48 + ("sigmoid_mul_kernel_npu",)
+SCATTER = "static_kernel_ScatterPaKvCache_abcd"
+GATE = "sigmoid_mul_kernel_npu"
+FLASHES = (FLASH,) + tuple(f"{FLASH}_layer{i}" for i in range(47))
+NAMES = ("kv_write",) + FLASHES + (GATE,)
 
 
 def log(names=NAMES, edges=(), operation="cann_ops_transformer.flash_attn_metadata.default"):
+    return scoped_log([(names, (), edges)], operation)
+
+
+def scoped_log(scopes, operation="cann_ops_transformer.flash_attn_metadata.default"):
     prefix = "[time] WeLM MK capture ShapeKey(size=1, stream_idx=None, variant_label=None)"
     boundary = {"operation": operation, "reason": "AI CPU", "calls": 1, "observed_kernels": 1,
                 "tensor_signatures": [[{"shape": [1], "dtype": "torch.int32"}]]}
     summary = {"torch_boundaries": [boundary], "native_globals": [], "native_collectives": []}
-    lines = [
-        f"{prefix}: {len(names) + 1} kernels, 1 scopes, {len(names)} fused kernels, "
-        f"1 Torch boundaries, {len(edges)} tile edges",
-        f"{prefix} scope 0 kernels {names!r} coarse edges [('kept', '{FLASH}')] tile ratios {{}}",
-        f"{prefix} boundaries {summary!r}",
-    ]
-    if edges:
-        lines.insert(1, f"{prefix} scope 0 tile edges {list(edges)!r}")
+    count = sum(len(names) for names, _, _ in scopes)
+    tiles = sum(len(edges) for _, _, edges in scopes)
+    lines = [f"{prefix}: {count + 1} kernels, {len(scopes)} scopes, {count} fused kernels, 1 Torch boundaries, {tiles} tile edges"]
+    for i, (names, full, edges) in enumerate(scopes):
+        lines.append(f"{prefix} scope {i} kernels {tuple(names)!r} coarse edges {list(full)!r} tile ratios {{}}")
+        if edges:
+            lines.append(f"{prefix} scope {i} tile edges {list(edges)!r}")
+    lines.append(f"{prefix} boundaries {summary!r}")
     return lines
 
 
@@ -37,7 +44,7 @@ class NativeCaptureComparisonTest(unittest.TestCase):
         self.assertEqual(summary["flash_outputs"], {"sigmoid_mul_kernel_npu": 1})
 
     def test_coarse_flash_consumers_are_reported_separately(self):
-        lines = [l.replace(f"('kept', '{FLASH}')", f"('{FLASH}', 'sigmoid_mul_kernel_npu')") for l in log()]
+        lines = scoped_log([(NAMES, [(FLASH, GATE)], [])])
         summary = self.check(lines, lines)["buckets"][1]["fine"]
         self.assertEqual(summary["flash_coarse_outputs"], {"sigmoid_mul_kernel_npu": 1})
         self.assertEqual(summary["flash_outputs"], {})
@@ -46,6 +53,42 @@ class NativeCaptureComparisonTest(unittest.TestCase):
         fine = log(edges=[("kv_write", "sigmoid_mul_kernel_npu")])
         self.assertEqual(self.check(log(), fine)["errors"], [])
         self.assertTrue(self.check(log(), fine, strict=True)["errors"])
+
+    def test_edges_on_same_named_flashes_in_different_scopes_do_not_join(self):
+        scopes = [((SCATTER, FLASH), (), [(SCATTER, FLASH)]),
+                  ((FLASH, GATE), (), [(FLASH, GATE)]), (FLASHES[2:], (), ())]
+        coarse = scoped_log([(names, (), ()) for names, _, _ in scopes])
+        result = self.check(coarse, scoped_log(scopes), strict=True)
+        self.assertTrue(result["errors"])
+        self.assertEqual(result["buckets"][1]["fine"]["tile_flash_chains"],
+                         dict(two_sided=0, scatter_inputs=1, gate_outputs=1, scatter_flash_gate=0))
+
+    def test_ambiguous_same_scope_flash_name_cannot_pass(self):
+        names = (SCATTER, FLASH, FLASH, GATE, *FLASHES[2:])
+        edges = [(SCATTER, FLASH), (FLASH, GATE)]
+        fine = scoped_log([(names, (), edges)])
+        result = self.check(log(names), fine, strict=True)
+        self.assertTrue(result["errors"])
+        self.assertEqual(result["buckets"][1]["fine"]["tile_flash_chains"]["two_sided"], 0)
+
+    def test_exclusive_and_embedded_chains_count_instances(self):
+        native_edges = [(SCATTER, FLASH), (FLASH, GATE)]
+        names = (SCATTER, FLASH, GATE)
+        layout = [names, ("extra", *names), FLASHES[2:]]
+        coarse = scoped_log([(k, native_edges if i < 2 else (), ()) for i, k in enumerate(layout)])
+        fine = scoped_log([(k, (), native_edges if i < 2 else ()) for i, k in enumerate(layout)])
+        result = self.check(coarse, fine, strict=True)
+        self.assertFalse(result["errors"])
+        summary = result["buckets"][1]
+        self.assertEqual(summary["fine"]["exclusive_scatter_flash_gate_scopes"], 1)
+        self.assertEqual(summary["coarse"]["coarse_flash_chains"]["scatter_flash_gate"], 2)
+        self.assertEqual(summary["fine"]["tile_flash_chains"]["scatter_flash_gate"], 2)
+
+    def test_different_flashes_in_one_scope_cannot_join(self):
+        edges = [("kv_write", FLASHES[0]), (FLASHES[1], GATE)]
+        result = self.check(log(), log(edges=edges), strict=True)
+        self.assertTrue(result["errors"])
+        self.assertEqual(result["buckets"][1]["fine"]["tile_flash_chains"]["two_sided"], 0)
 
     def test_mismatches_and_split_kernels_fail(self):
         cases = [

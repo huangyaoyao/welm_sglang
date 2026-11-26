@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 
-def scatter_inputs_by_row(*, tiling_key, block_dim, dtype, layout, tiling, scatter_cache_ptrs,
+def scatter_inputs_by_row(*, tiling_key, block_dim, dtype, layout, tiling, key_shape, value_shape, scatter_cache_ptrs,
                           flash_cache_ptrs, slot_mapping, block_table, kv_lengths):
     # A5 scatter_pa_kv_cache_apt.cpp dispatches these Norm keys to the dual
     # fully_load/not_fully_load variants. Both index slot_mapping by
@@ -21,9 +21,14 @@ def scatter_inputs_by_row(*, tiling_key, block_dim, dtype, layout, tiling, scatt
     if tiling_key not in (141, 181, 100) or dtype != "bfloat16" or layout != "PA_BBND":
         raise ValueError("requires a BF16 dual K/V Norm scatter and PA_BBND Flash")
     groups, block, tail = (tiling[k] for k in ("usedCoreNum", "blockFactor", "tailBlockFactor"))
-    pages, width, tokens = (tiling[k] for k in ("numBlocks", "blockSize", "numTokens"))
+    pages, width = tiling["numBlocks"], tiling["blockSize"]
+    # Norm does not populate the raw numTokens field in the A5 tiling packet.
+    # Use the actual compiled tensor descriptors and the rows assigned to AIVs.
+    tokens = len(slot_mapping)
+    if list(key_shape) != [tokens, 2, 256] or list(value_shape) != [tokens, 2, 256]:
+        raise ValueError("unrecognized scatter input shapes")
     if not (groups == block_dim and groups > 0 and 0 < tail <= block and pages > 0
-            and (groups - 1) * block + tail == tokens == len(slot_mapping)
+            and (groups - 1) * block + tail == tokens
             and width == 64 and len(block_table) == len(kv_lengths) == tokens):
         raise ValueError("inconsistent scatter launch geometry or decode row count")
     if (tiling["numHead"], tiling["kHeadSize"], tiling["vHeadSize"],
@@ -80,6 +85,44 @@ def scatter_inputs_by_flash_group(rows, fa_group_owners):
     for (row, _), group in fa_group_owners.items():
         parents[group].update(rows[row])
     return {group: sorted(writers) for group, writers in sorted(parents.items())}
+
+
+def frozen_scatter_flash_waits(scatter, owners, physical_groups):
+    """Check the data dependencies of the fixed B8 A5 scatter/Flash fixture.
+
+    Pass owners from short_decode_final_groups for the same immutable FA
+    operands and tiling. Static queue admission for the physical participants
+    is a separate device runtime condition.
+    """
+    fields = scatter["tiling"]
+    batch = 8
+    if (physical_groups != 32 or scatter["tiling_key"] != 141 or scatter["block_dim"] != batch
+            or len(scatter["slot_mapping"]) != batch or fields["blockFactor"] != 1
+            or fields["tailBlockFactor"] != 1 or fields["usedCoreNum"] != batch):
+        raise ValueError("expected the audited B8 row-per-AIV scatter and full-width MIX")
+    expected = {(row, head): 2 * row + head for row in range(batch) for head in (0, 1)}
+    if owners != expected:
+        raise ValueError("unexpected FA assignment for the fixed input mapping")
+    rows = scatter_inputs_by_row(**scatter)
+    for row, length in enumerate(scatter["kv_lengths"]):
+        if not 1 <= length <= 256:
+            raise ValueError("expected eight active single-S2 rows")
+        page, offset = divmod(length - 1, fields["blockSize"])
+        last_slot = scatter["block_table"][row][page] * fields["blockSize"] + offset
+        if scatter["slot_mapping"][row] != last_slot:
+            raise ValueError("scatter slot does not append to the same physical row used by Flash")
+    hazards = scatter_inputs_by_flash_group(rows, owners)
+    waits = []
+    for group in range(physical_groups):
+        if group in hazards:
+            writer = group // 2
+            if hazards[group] != [writer]:
+                raise ValueError("Flash group can read another scatter writer's physical page")
+            waits.append([writer])
+        else:
+            # Inactive Flash groups still enter CANN's initialization barrier.
+            waits.append(list(range(batch)))
+    return waits
 
 
 if __name__ == "__main__":

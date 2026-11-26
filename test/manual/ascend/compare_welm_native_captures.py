@@ -14,6 +14,8 @@ COUNTS = re.compile(
 )
 SCOPE = re.compile(r" scope (\d+) (kernels|tile edges) (.+)")
 FLASH = "static_kernel_FlashAttn_"
+SCATTER = "static_kernel_ScatterPaKvCache_"
+GATE = "sigmoid_mul_kernel_npu"
 # MK-specific replacements for original BF16 decode operators. Match both
 # scope kernel names and retained launch names such as triton::_prepare_flash_pages.
 REPLACEMENTS = {
@@ -91,13 +93,36 @@ def read_captures(lines, buckets):
         if (kernels.keys() != set(range(scopes)) or not edges.keys() <= kernels.keys()
                 or sum(map(len, kernels.values())) != fused or sum(map(len, edges.values())) != tiles):
             raise ValueError(f"bs={bs} scope/edge evidence differs from capture totals")
-        for i, pairs in edges.items():
-            names = set(kernels[i])
-            if any(src not in names or dst not in names for src, dst in pairs):
-                raise ValueError(f"bs={bs} scope {i} has tile edges with unknown kernels")
+        for kind in ("edges", "coarse_edges"):
+            for i, pairs in cap[kind].items():
+                names = set(kernels[i])
+                if not isinstance(pairs, list) or any(
+                    not isinstance(pair, tuple) or len(pair) != 2 or not all(name in names for name in pair)
+                    for pair in pairs
+                ):
+                    raise ValueError(f"bs={bs} scope {i} has invalid {kind} or unknown kernels")
         if sum(row["calls"] for row in cap["boundaries"]["torch_boundaries"]) != boundaries:
             raise ValueError(f"bs={bs} boundary details differ from capture totals")
     return captures
+
+
+def _flash_chains(cap, edge_key):
+    """Name-only logs identify a Flash instance by (scope, unique kernel name)."""
+    both = scatter_in = gate_out = native_chains = 0
+    for scope, kernels in cap["kernels"].items():
+        counts = Counter(kernels)
+        pairs = cap[edge_key].get(scope, ())
+        inputs = {dst for src, dst in pairs if src != dst}
+        outputs = {src for src, dst in pairs if src != dst}
+        from_scatter = {dst for src, dst in pairs if src.startswith(SCATTER)}
+        to_gate = {src for src, dst in pairs if dst == GATE}
+        unique = {name for name, n in counts.items() if n == 1 and name.startswith(FLASH)}
+        both += len(unique & inputs & outputs)
+        scatter_in += len(unique & from_scatter)
+        gate_out += len(unique & to_gate)
+        native_chains += len(unique & from_scatter & to_gate)
+    return dict(two_sided=both, scatter_inputs=scatter_in, gate_outputs=gate_out,
+                scatter_flash_gate=native_chains)
 
 
 def summarize(cap):
@@ -122,7 +147,14 @@ def summarize(cap):
     for rows in cap["boundaries"].values():
         names.extend(row.get("operation", row.get("kernel", "")) for row in rows)
     replacements = sorted({k for name in names for k in re.findall(r"\w+", name)} & REPLACEMENTS)
+    exclusive = sum(
+        len(group) == 3 and group[0].startswith(SCATTER) and group[1].startswith(FLASH) and group[2] == GATE
+        for group in cap["kernels"].values()
+    )
     return dict(kernels=kernels, scopes=scopes, fused=fused, torch_boundaries=boundaries,
+                exclusive_scatter_flash_gate_scopes=exclusive,
+                coarse_flash_chains=_flash_chains(cap, "coarse_edges"),
+                tile_flash_chains=_flash_chains(cap, "edges"),
                 boundary_ops=boundaries_by_op, tile_edges=tiles,
                 flash_kernels=sum(k.startswith(FLASH) for group in cap["kernels"].values() for k in group),
                 flash_inputs=inputs, flash_outputs=outputs, flash_coarse_inputs=coarse_inputs,
@@ -181,8 +213,8 @@ def compare(coarse, fine, buckets, require_flash_tiles=False, elf_manifest=None)
                 break
         if elf_manifest is not None:
             arms["verified_specializations"] = [list(pair) for pair in sorted(verified)]
-        if require_flash_tiles and not (arms["fine"]["flash_inputs"] and arms["fine"]["flash_outputs"]):
-            errors.append(f"bs={bs} fine arm lacks direct FlashAttn tile inputs or outputs")
+        if require_flash_tiles and not arms["fine"]["tile_flash_chains"]["two_sided"]:
+            errors.append(f"bs={bs} fine arm has no unambiguous FlashAttn with direct input and output tile edges in one scope")
     return result
 
 
@@ -192,7 +224,7 @@ def main():
     parser.add_argument("fine", type=Path)
     parser.add_argument("--buckets", nargs="+", type=int, default=[1, 2, 4, 8])
     parser.add_argument("--require-flash-tiles", action="store_true",
-                        help="require direct tile inputs and outputs for complete FlashAttn in each bucket")
+                        help="require a uniquely identified FlashAttn with both direct tile edges in one scope per bucket")
     parser.add_argument("--elf-manifest", type=Path,
                         help="compare differing names by recorded ELF code, allocatable sections, text relocations and launch descriptors")
     args = parser.parse_args()
