@@ -108,6 +108,7 @@ if is_npu():
 
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
         welm_model_row_tiles_active,
+        welm_native_gate_first_active,
         welm_page_gate_tiles_active,
         welm_single_pk_decode_active,
     )
@@ -3147,15 +3148,21 @@ class Qwen2MoeAttention(nn.Module):
             self.supports_mk_page_gate and self.gated_self_attention_headwise
             and fused_qkv is None and forward_batch.welm_prefill_graph is None
             and forward_batch.forward_mode.is_decode() and not torch.compiler.is_compiling()
-            and welm_page_gate_tiles_active()
             and hidden_states.dtype == torch.bfloat16 and hidden_states.shape[0] in (1, 2, 4, 8)
             and (self.alt_stream is None or not envs.SGLANG_NPU_USE_MULTI_STREAM.get())
-            and getattr(get_attn_backend(), "use_mk_page_attention", False)
         ):
-            # This projection only reads the input hidden states. Its CANN
-            # matmul can start a new MK segment, so run it before the QKV/page
-            # chain to keep the in-place gate in the same segment as the merge.
-            gate = self._headwise_gate(hidden_states)
+            gate_first = welm_page_gate_tiles_active() and getattr(get_attn_backend(), "use_mk_page_attention", False)
+            if (welm_native_gate_first_active() and forward_batch.spec_info is None
+                    and getattr(get_attn_backend(), "use_welm_flash_attn", False)):
+                from sglang.srt.hardware_backend.npu.graph_runner.welm_row_projection import plain_linear
+
+                gate_first = (plain_linear(self.gate_proj, ColumnParallelLinear)
+                              and self.gate_proj.tp_size == 1 and not self.gate_proj.gather_output
+                              and not self.attn._forward_hooks and not self.attn._forward_pre_hooks)
+            if gate_first:
+                # Gate projection only reads hidden_states. Keep its original
+                # matmul ahead of QKV so sigmoid can share Flash's MK scope.
+                gate = self._headwise_gate(hidden_states)
         if fused_qkv is not None:
             q, k, v, mirror_k, mirror_v = fused_qkv
             if mirror_k is not None:

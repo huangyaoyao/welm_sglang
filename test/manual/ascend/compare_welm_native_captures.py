@@ -47,7 +47,7 @@ def read_captures(lines, buckets):
         if counts:
             if bs in captures:
                 raise ValueError(f"bs={bs} has multiple captures; supply one run per log")
-            captures[bs] = dict(counts=tuple(map(int, counts.groups())), kernels={}, edges={})
+            captures[bs] = dict(counts=tuple(map(int, counts.groups())), kernels={}, edges={}, coarse_edges={})
             continue
         try:
             cap = captures[bs]
@@ -55,9 +55,13 @@ def read_captures(lines, buckets):
             if scope:
                 index, kind, value = scope.groups()
                 if kind == "kernels":
-                    names, sep, _ = value.partition(" coarse edges ")
+                    names, sep, after = value.partition(" coarse edges ")
                     if not sep:
                         raise ValueError("incomplete kernel list")
+                    pairs, sep, _ = after.partition(" tile ratios ")
+                    if not sep:
+                        raise ValueError("incomplete coarse edge list")
+                    cap["coarse_edges"][int(index)] = _literal(pairs)
                     dest, value = cap["kernels"], _literal(names)
                     if not isinstance(value, tuple) or not all(isinstance(k, str) for k in value):
                         raise ValueError("expected tuple of kernel names")
@@ -98,13 +102,18 @@ def read_captures(lines, buckets):
 
 def summarize(cap):
     names = [k for group in cap["kernels"].values() for k in group]
-    inputs, outputs = Counter(), Counter()
-    for pairs in cap["edges"].values():
-        for src, dst in pairs:
-            if dst.startswith(FLASH):
-                inputs[src] += 1
-            if src.startswith(FLASH):
-                outputs[dst] += 1
+    def flash_neighbours(edges):
+        inputs, outputs = Counter(), Counter()
+        for pairs in edges.values():
+            for src, dst in pairs:
+                if dst.startswith(FLASH):
+                    inputs[src] += 1
+                if src.startswith(FLASH):
+                    outputs[dst] += 1
+        return inputs, outputs
+
+    inputs, outputs = flash_neighbours(cap["edges"])
+    coarse_inputs, coarse_outputs = flash_neighbours(cap["coarse_edges"])
     kernels, scopes, fused, boundaries, tiles = cap["counts"]
     rows = cap["boundaries"]["torch_boundaries"]
     boundaries_by_op = Counter()
@@ -116,7 +125,8 @@ def summarize(cap):
     return dict(kernels=kernels, scopes=scopes, fused=fused, torch_boundaries=boundaries,
                 boundary_ops=boundaries_by_op, tile_edges=tiles,
                 flash_kernels=sum(k.startswith(FLASH) for group in cap["kernels"].values() for k in group),
-                flash_inputs=inputs, flash_outputs=outputs, replacements=replacements)
+                flash_inputs=inputs, flash_outputs=outputs, flash_coarse_inputs=coarse_inputs,
+                flash_coarse_outputs=coarse_outputs, replacements=replacements)
 
 
 def _compiled_contract(name, manifest):

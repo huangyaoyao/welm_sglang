@@ -202,6 +202,7 @@ class WelmNativeBackendTest(unittest.TestCase):
 
         def check_dispatch():
             self.assertTrue(layouts.welm_original_kernels_active())
+            self.assertTrue(layouts.welm_native_gate_first_active())
             self.assertFalse(layouts.welm_decode_tiles_active())
             self.assertFalse(layouts.welm_single_pk_decode_active())
             self.assertFalse(layouts.welm_model_row_tiles_active())
@@ -209,7 +210,8 @@ class WelmNativeBackendTest(unittest.TestCase):
             self.assertIsNone(layouts.welm_decode_tile_workspace())
 
         settings = {"SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY": "1",
-                    "WELM_NPU_USE_FLASH_ATTN": "1"}
+                    "WELM_NPU_USE_FLASH_ATTN": "1",
+                    "SGLANG_NPU_WELMV4_MK_NATIVE_FLASH_GATE_FIRST": "1"}
         utils = SimpleNamespace(get_bool_env_var=lambda name, *args: os.getenv(name) == "1")
         with patch.dict(sys.modules, {"sglang.srt.utils": utils}), \
                 patch.dict(scope_globals, decode_tile_scope=layouts.decode_tile_scope), \
@@ -221,6 +223,7 @@ class WelmNativeBackendTest(unittest.TestCase):
                     self.assertTrue(any("1 fused FlashAttn, 1 incoming and 1 outgoing Flash tile edges" in entry
                                         for entry in logs.output), logs.output)
                     self.assertFalse(layouts.welm_original_kernels_active())
+                    self.assertFalse(layouts.welm_native_gate_first_active())
 
     def test_reject_unrelated_model(self):
         with self.assertRaisesRegex(ValueError, "WeLMV4"):

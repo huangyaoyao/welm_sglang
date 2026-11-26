@@ -36,6 +36,12 @@ class NativeCaptureComparisonTest(unittest.TestCase):
         self.assertEqual(summary["flash_inputs"], {"kv_write": 1})
         self.assertEqual(summary["flash_outputs"], {"sigmoid_mul_kernel_npu": 1})
 
+    def test_coarse_flash_consumers_are_reported_separately(self):
+        lines = [l.replace(f"('kept', '{FLASH}')", f"('{FLASH}', 'sigmoid_mul_kernel_npu')") for l in log()]
+        summary = self.check(lines, lines)["buckets"][1]["fine"]
+        self.assertEqual(summary["flash_coarse_outputs"], {"sigmoid_mul_kernel_npu": 1})
+        self.assertEqual(summary["flash_outputs"], {})
+
     def test_other_tile_edges_do_not_count_as_flash_edges(self):
         fine = log(edges=[("kv_write", "sigmoid_mul_kernel_npu")])
         self.assertEqual(self.check(log(), fine)["errors"], [])

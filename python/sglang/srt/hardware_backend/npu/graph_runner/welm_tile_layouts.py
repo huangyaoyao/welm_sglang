@@ -36,6 +36,14 @@ def welm_decode_tiles_active():
     return welm_decode_tile_workspace() is not None
 
 
+def welm_native_gate_first_active():
+    if _decode_active.get() is not _ORIGINAL_KERNELS_ONLY:
+        return False
+    from sglang.srt.utils import get_bool_env_var
+
+    return get_bool_env_var("SGLANG_NPU_WELMV4_MK_NATIVE_FLASH_GATE_FIRST")
+
+
 def welm_single_pk_decode_active():
     workspace = welm_decode_tile_workspace()
     return workspace is not None and workspace.get("single_pk") is True
