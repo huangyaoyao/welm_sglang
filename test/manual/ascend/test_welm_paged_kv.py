@@ -49,6 +49,9 @@ class WelmPagedKVTest(unittest.TestCase):
 
                 plan = capture_fixed(forward, build, tile_chains=True)
                 try:
+                    if page_size == 128:
+                        self.assertEqual(plan.host_boundary_count, 0, plan.execution_summary)
+                        self.assertEqual(plan.fused_operator_count, 1, plan.execution_summary)
                     for req, used, loc in (([1, 2, 3, 1, 2, 3, 2, 1], [129, 64, 1, 0, 65, 128, 129, 64],
                                             [257, 67, 128, -1, 64, 256, 0, 65]),
                                            ([2, 3, 2, 3, 1, 2, 3, 2], [70, 145, 1, 64, 145, 65, 129, 1],

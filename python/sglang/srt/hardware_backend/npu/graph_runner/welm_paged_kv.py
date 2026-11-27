@@ -10,6 +10,12 @@ from .welm_tile_layouts import welm_decode_tiles_active, welm_native_region_acti
 
 _DECODE_BATCH_SIZES = (1, 2, 4, 8)
 
+# Validated Flash page-table specializations: (maximum table columns, Triton launch options).
+_FLASH_PAGE_PROFILES = {
+    64: (64, {}),
+    128: (2048, {"compile_mode": "simd"}),
+}
+
 
 def _write_layout(k, v, slots, keys, values, k_stride, v_stride, pages, group, rows):
     page_bytes = 64 * 512 * keys.element_size()
@@ -165,8 +171,10 @@ def _prepare_flash_pages(req_map, requests, lengths, slots, mapping, full_table,
 
 def prepare_flash_pages(req_map, requests, lengths, slots, full_table, q_used, kv_used,
                         mapping=None, swa_table=None, swa_slots=None, *, page_size=64):
-    if page_size not in (64, 128) or not _page_metadata_active() or req_map.device.type != "npu":
+    profile = _FLASH_PAGE_PROFILES.get(page_size)
+    if profile is None or not _page_metadata_active() or req_map.device.type != "npu":
         return False
+    max_columns, launch_options = profile
     hybrid = mapping is not None
     if hybrid != (swa_table is not None) or hybrid != (swa_slots is not None):
         return False
@@ -177,7 +185,7 @@ def prepare_flash_pages(req_map, requests, lengths, slots, full_table, q_used, k
     if (any(t is None or t.shape != (rows,) for t in vectors)
             or req_map.ndim != 2 or req_map.stride(1) != 1
             or full_table.ndim != 2 or full_table.shape[0] != rows
-            or not 1 <= full_table.shape[1] <= (2048 if page_size == 128 else 64)
+            or not 1 <= full_table.shape[1] <= max_columns
             or not torch.npu.get_device_name(req_map.device).startswith("Ascend950")):
         return False
     buffers = (*vectors, full_table)
@@ -194,5 +202,6 @@ def prepare_flash_pages(req_map, requests, lengths, slots, full_table, q_used, k
         req_map, requests, lengths, slots, mapping, full_table, swa_table, swa_slots,
         q_used, kv_used, req_map.stride(0), req_map.shape[1], mapping.numel() if hybrid else 0,
         columns, triton.next_power_of_2(columns), hybrid, page_size.bit_length() - 1,
+        **launch_options,
     )
     return True
