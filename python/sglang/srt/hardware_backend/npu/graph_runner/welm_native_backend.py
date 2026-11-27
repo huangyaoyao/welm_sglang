@@ -37,24 +37,27 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         self._retain_if_failed = retain_if_failed
         args = model_runner.server_args
         mode = getattr(runner, "capture_forward_mode", None)
-        self._single_pk_worker = (
+        ordinary_decode = (
             "WeLMV4MoeForCausalLM" in architectures
             and mode is not None
             and mode.is_decode()
             and not model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_none()
-            and (args.tp_size, args.dp_size, args.ep_size, args.pp_size) == (1, 1, 1, 1)
             and self.device.get_device_name().startswith("Ascend950")
         )
+        topology = (args.tp_size, args.dp_size, args.ep_size, args.pp_size)
+        self._single_pk_worker = ordinary_decode and topology == (1, 1, 1, 1)
         config = model_runner.model_config
         self._native_region_worker = (
-            self._single_pk_worker and getattr(config, "quantization", None) is None
+            ordinary_decode and topology in ((1, 1, 1, 1), (4, 4, 4, 1), (8, 8, 8, 1))
+            and getattr(config, "quantization", None) is None
             and getattr(config, "dtype", None) is not None and config.dtype == torch.bfloat16
         )
         self._workspace_pool_factory = None
         self._workspace_pool = None
         if (
             self._native_region_worker and not getattr(runner, "enable_pdmux", False)
+            and not getattr(args, "enable_two_batch_overlap", False)
             and os.environ.get("SGLANG_NPU_WELMV4_MK_SHARE_DECODE_WORKSPACE") == "1"
             and os.environ.get("SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY") == "1"
             and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "1"
@@ -93,12 +96,13 @@ class WelmNativeBackend(BaseCudaGraphBackend):
         directory = self.directory / key
         directory.mkdir(exist_ok=True, parents=True)
         native_ops_only = (
-            self._single_pk_worker
+            (self._single_pk_worker or self._native_region_worker)
             and os.environ.get("SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY") == "1"
         )
+        buckets = (1, 2, 4, 8, 12, 16) if native_ops_only and not self._single_pk_worker else (1, 2, 4, 8)
         retain_intermediates = (
-            self._single_pk_worker
-            and getattr(shape_key, "size", None) in (1, 2, 4, 8)
+            (self._single_pk_worker or native_ops_only)
+            and getattr(shape_key, "size", None) in buckets
             and (native_ops_only or os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "0")
             and "retain_intermediates" in signature(capture_fixed).parameters
         )

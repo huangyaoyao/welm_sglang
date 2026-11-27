@@ -11,7 +11,12 @@ class WelmPagedKVTest(unittest.TestCase):
             with self.subTest(batch=batch):
                 self._flash_metadata_replay(batch)
 
-    def _flash_metadata_replay(self, batch):
+    def test_ep_flash_page_tables(self):
+        for batch in (1, 8, 12, 16):
+            with self.subTest(batch=batch):
+                self._flash_metadata_replay(batch, page_size=128, columns=2048)
+
+    def _flash_metadata_replay(self, batch, page_size=64, columns=4):
         try:
             import torch
             import torch_npu
@@ -29,7 +34,7 @@ class WelmPagedKVTest(unittest.TestCase):
         mapping[-1] = -1
         ids, lengths, slots = [torch.zeros(batch, dtype=torch.int32, device="npu") for _ in range(3)]
         def table():
-            return torch.zeros((batch + 1, 4), dtype=torch.int32, device="npu")[1:]
+            return torch.zeros((batch + 1, columns), dtype=torch.int32, device="npu")[1:]
         full, swa = table(), table()
         written, qs, ks = (torch.zeros_like(slots) for _ in range(3))
         with torch.inference_mode(), decode_tile_scope(), tempfile.TemporaryDirectory() as build:
@@ -37,7 +42,8 @@ class WelmPagedKVTest(unittest.TestCase):
                 def forward():
                     enabled = prepare_flash_pages(req_map, ids, lengths, slots, full, qs, ks,
                                                   mapping if hybrid else None,
-                                                  swa if hybrid else None, written if hybrid else None)
+                                                  swa if hybrid else None, written if hybrid else None,
+                                                  page_size=page_size)
                     self.assertTrue(enabled)
                     return (full, qs, ks, swa, written) if hybrid else (full, qs, ks)
 
@@ -49,7 +55,7 @@ class WelmPagedKVTest(unittest.TestCase):
                                             [65, -1, 66, 67, 256, 64, 65, 257]),
                                            ([999, 1, 2, 999, 1, 999, 3, 999], [0, 1, 130, 0, 64, 0, 128, 0],
                                             [-1, 65, 67, -1, 128, -1, 65, -1])):
-                        req, used, loc = req[:batch], used[:batch], loc[:batch]
+                        req, used, loc = (req * 2)[:batch], (used * 2)[:batch], (loc * 2)[:batch]
                         ids.copy_(torch.tensor(req))
                         lengths.copy_(torch.tensor(used))
                         slots.copy_(torch.tensor(loc))
@@ -59,14 +65,14 @@ class WelmPagedKVTest(unittest.TestCase):
                         ref_map[3, ::64] = torch.tensor([384, 64, 128])
                         req_map.copy_(ref_map)
                         results = plan.replay()
-                        expected_full = torch.zeros((batch, 4), dtype=torch.int32)
+                        expected_full = torch.zeros((batch, columns), dtype=torch.int32)
                         expected_swa = expected_full.clone()
                         map_cpu = mapping.cpu()
                         for row in range(batch):
-                            for column in range((used[row] + 63) // 64):
-                                physical = int(ref_map[req[row], 64 * column])
-                                expected_full[row, column] = physical // 64
-                                expected_swa[row, column] = map_cpu[physical] // 64
+                            for column in range((used[row] + page_size - 1) // page_size):
+                                physical = int(ref_map[req[row], page_size * column])
+                                expected_full[row, column] = physical // page_size
+                                expected_swa[row, column] = map_cpu[physical] // page_size
                         expected = [expected_full, (lengths.cpu() > 0).int(), lengths.cpu()]
                         if hybrid:
                             dest = [map_cpu[slot].item() if n else 0 for slot, n in zip(loc, used)]

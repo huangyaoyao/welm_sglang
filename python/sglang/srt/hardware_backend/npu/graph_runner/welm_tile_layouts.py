@@ -23,7 +23,7 @@ def decode_tile_scope(*, single_pk=False, native_ops_only=False, batch=None):
         if get_bool_env_var("SGLANG_NPU_WELMV4_MK_PAGE_GATE_TILES"):
             workspace["page_attention_output"] = None
     regions = set()
-    if (native_ops_only and batch in (1, 2, 4, 8)
+    if (native_ops_only and batch in (1, 2, 4, 8, 12, 16)
             and os.environ.get("MK_NATIVE_TILE_DEPENDENCIES") == "1"):
         requested = os.environ.get("SGLANG_NPU_WELMV4_MK_NATIVE_REGIONS", "")
         regions.update(name.strip() for name in requested.split(",") if name.strip())

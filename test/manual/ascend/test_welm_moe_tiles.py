@@ -150,7 +150,11 @@ class MoeTilesDeviceTest(unittest.TestCase):
     def test_expert_capacity_below_core_count(self):
         self._check_expert_rows(small=True)
 
-    def _check_expert_rows(self, small=False):
+    def test_ep4_bf16_local_expert_capacity(self):
+        # WeLM has 512 routed experts, so EP4 owns 128 per rank.
+        self._check_expert_rows(small=True, experts=128)
+
+    def _check_expert_rows(self, small=False, experts=2):
         from megakernel._fixed import capture_fixed
         from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
         from sgl_kernel_npu.norm.l1_norm import l1_norm
@@ -165,7 +169,8 @@ class MoeTilesDeviceTest(unittest.TestCase):
         width = 256
         x = torch.empty((rows, width * 2), device="npu", dtype=torch.bfloat16)
         x.fill_(1)
-        groups = torch.tensor([rows, 0], device="npu", dtype=torch.int64)
+        groups = torch.zeros(experts, device="npu", dtype=torch.int64)
+        groups[0] = rows
 
         def forward():
             activation, _ = swiglu_quant(x, groups, 1, need_quant=False)
@@ -183,14 +188,17 @@ class MoeTilesDeviceTest(unittest.TestCase):
                 for valid in (rows, rows // 2, 0):
                     new_x = 1 + torch.rand(x.shape, generator=seed)
                     x.copy_(new_x.to(torch.bfloat16))
-                    groups.copy_(torch.tensor([0, rows], dtype=groups.dtype))
+                    groups.zero_()
+                    groups[-1] = rows
                     # Ordinary eager globals compute all rows of the reference.
                     eager_activation, eager_norm = forward()
                     expected_activation, expected_norm = eager_activation.cpu(), eager_norm.cpu()
                     expected_activation[valid:] = 7
                     expected_norm[valid:] = 1 / width
                     plan.outputs[0].fill_(7)
-                    groups.copy_(torch.tensor([0, valid], dtype=groups.dtype))
+                    groups.zero_()
+                    groups[0] = valid // 2
+                    groups[-1] = valid - valid // 2
                     activation, norm = plan.replay()
                     torch.testing.assert_close(activation.cpu(), expected_activation, atol=0, rtol=0)
                     torch.testing.assert_close(norm.cpu(), expected_norm, atol=0, rtol=0)

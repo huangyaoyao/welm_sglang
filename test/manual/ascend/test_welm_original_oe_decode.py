@@ -22,9 +22,10 @@ class OriginalOeDecode(unittest.TestCase):
 
         vocab = 155648
         sizes = (16000008, 16000016, 16000024, 16000032)
-        for batch in (1, 2, 4, 8):
+        for batch in (1, 2, 4, 8, 12, 16):
+            pitch = 1 << (batch - 1).bit_length()
             with self.subTest(batch=batch), torch.inference_mode(), TemporaryDirectory() as build:
-                table = torch.zeros((9, 512), dtype=torch.int32, device="npu")
+                table = torch.zeros((17, 512), dtype=torch.int32, device="npu")
                 ids = torch.zeros(batch, dtype=torch.int64, device="npu")
                 rows = torch.zeros_like(ids)
                 pos = torch.zeros(batch, dtype=torch.int32, device="npu")
@@ -46,15 +47,15 @@ class OriginalOeDecode(unittest.TestCase):
                                  for task in plan.tasks if isinstance(task, dict)]
                     self.assertTrue(any(provider == "triton" and "_welmv4_oe_hash_decode_4way_kernel" in name
                                         for provider, name in providers), providers)
-                    self.assertEqual(plan.outputs.stride(), (batch, 1))
-                    self.assertEqual(plan.outputs.untyped_storage().nbytes(), 4 * batch * 4)
+                    self.assertEqual(plan.outputs.stride(), (pitch, 1))
+                    self.assertEqual(plan.outputs.untyped_storage().nbytes(), 4 * pitch * 4)
                     ptr = plan.outputs.data_ptr()
                     for step in range(4):
                         gen = torch.Generator().manual_seed(773 + step)
-                        history = torch.randint(vocab, (9, 512), generator=gen, dtype=torch.int32)
+                        history = torch.randint(vocab, (17, 512), generator=gen, dtype=torch.int32)
                         current = torch.randint(vocab, (batch,), generator=gen)
-                        req = torch.randperm(9, generator=gen)[:batch]
-                        positions = torch.tensor([0, 1, 2, 511] * 2, dtype=torch.int32).roll(step)[:batch]
+                        req = torch.randperm(17, generator=gen)[:batch]
+                        positions = torch.tensor([0, 1, 2, 511] * 4, dtype=torch.int32).roll(step)[:batch]
                         for dst, src in zip((table, ids, rows, pos), (history, current, req, positions)):
                             dst.copy_(src)
                         reference = torch.empty(4, batch, dtype=torch.int32)
@@ -70,18 +71,18 @@ class OriginalOeDecode(unittest.TestCase):
                         torch.testing.assert_close(forward().cpu(), reference, rtol=0, atol=0)
                         # Detect writes past the compact view even if the NPU allocator
                         # normally rounds small allocations up to a larger size class.
-                        guard = torch.full((16 + 4 * batch,), -1, device="npu", dtype=torch.int32)
-                        view = guard[8:-8].view(4, batch)
+                        guard = torch.full((16 + 4 * pitch,), -1, device="npu", dtype=torch.int32)
+                        view = guard[8:-8].view(4, pitch)
                         kernels._welmv4_oe_hash_decode_4way_kernel[(1,)](
                             ids, table, rows, pos, view, batch, 512, 1,
                             VOCAB_SIZE=vocab, OE_V0=sizes[0], OE_V1=sizes[1],
                             OE_V2=sizes[2], OE_V3=sizes[3], HASH_MUL=2654435761,
-                            BLOCK_B=batch, PADDED_OUTPUT=True, compile_mode="simd",
+                            BLOCK_B=pitch, PADDED_OUTPUT=True, compile_mode="simd",
                         )
                         actual_guard = guard.cpu()
                         self.assertTrue(actual_guard[:8].eq(-1).all())
                         self.assertTrue(actual_guard[-8:].eq(-1).all())
-                        torch.testing.assert_close(actual_guard[8:-8].view(4, batch), reference, rtol=0, atol=0)
+                        torch.testing.assert_close(actual_guard[8:-8].view(4, pitch)[:, :batch], reference, rtol=0, atol=0)
                         plan.outputs.fill_(-1)
                         result = plan.replay()
                         self.assertEqual(result.data_ptr(), ptr)

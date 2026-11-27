@@ -109,6 +109,7 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
         welm_model_row_tiles_active,
         welm_native_gate_first_active,
+        welm_native_ops_only_active,
         welm_page_gate_tiles_active,
         welm_single_pk_decode_active,
     )
@@ -1228,6 +1229,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         enable_npu_decode_like_dual_stream = (
             _is_npu
+            and not welm_native_ops_only_active()
             and not force_serial_shared_expert
             and not use_welm_prefill_megamoe
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
@@ -3356,6 +3358,7 @@ class Qwen2MoeAttention(nn.Module):
         )
         enable_npu_gate_alt_stream = (
             _is_npu
+            and not welm_native_ops_only_active()
             # Keep the phase-one graph policy: Gate stays on the main stream
             # after Flash, including when native Flash itself is captured.
             and forward_batch.welm_prefill_graph is None

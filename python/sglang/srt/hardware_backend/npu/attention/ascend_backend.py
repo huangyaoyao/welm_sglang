@@ -1524,7 +1524,17 @@ class AscendAttnBackend(AttentionBackend):
 
         metadata = self.forward_metadata
         seq_lens = forward_batch.seq_lens
-        if self.page_size == 64 and welm_decode_tiles_active():
+        # The first recorded original metadata command also updates the two
+        # length buffers. The following separate page mask is deliberately
+        # created only after all AICPU schedules have been submitted.
+        lengths_ready = bool(previous_geometries) and self._prime_welm_decode_flash_schedules(
+            metadata, seq_lens, previous_geometries
+        )
+        ep_pages = (
+            self.page_size == 128 and welm_native_region_active("pages")
+            and (not self.is_hybrid_swa or type(self.token_to_kv_pool) is SWAKVPool)
+        )
+        if ep_pages or (self.page_size == 64 and welm_decode_tiles_active()):
             from sglang.srt.hardware_backend.npu.graph_runner.welm_paged_kv import prepare_flash_pages
 
             if prepare_flash_pages(
@@ -1532,15 +1542,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.out_cache_loc, metadata.block_tables,
                 metadata.welm_flash_seqused_q, metadata.welm_flash_seqused_kv,
                 self.full_to_swa_index_mapping if self.is_hybrid_swa else None,
-                metadata.block_tables_swa, metadata.swa_out_cache_loc,
+                metadata.block_tables_swa, metadata.swa_out_cache_loc, page_size=self.page_size,
             ):
                 return
-        # The first recorded original metadata command also updates the two
-        # length buffers. The following separate page mask is deliberately
-        # created only after all AICPU schedules have been submitted.
-        lengths_ready = bool(previous_geometries) and self._prime_welm_decode_flash_schedules(
-            metadata, seq_lens, previous_geometries
-        )
         valid_rows = seq_lens > 0
         divisor = None
         if welm_native_region_active("pages"):

@@ -5,7 +5,7 @@ import triton.language as tl
 
 from megakernel.triton import native
 
-from .welm_tile_layouts import welm_decode_tiles_active
+from .welm_tile_layouts import welm_decode_tiles_active, welm_native_region_active
 
 
 _DECODE_BATCH_SIZES = (1, 2, 4, 8)
@@ -115,9 +115,13 @@ def stage_flash_kv(k, v, slots, keys, values, table, lengths, workspace, *, copy
     return flash_k, flash_v
 
 
+def _page_metadata_active():
+    return welm_decode_tiles_active() or welm_native_region_active("pages")
+
+
 def _metadata_layout(req_map, requests, lengths, slots, mapping, full_table, swa_table,
                      swa_slots, q_used, kv_used, req_stride, context, map_size, columns,
-                     lanes, hybrid):
+                     lanes, hybrid, page_shift):
     reads = [(t, t.element_size()) for t in (requests, lengths, slots)]
     writes = [(q_used, q_used.element_size()), (kv_used, kv_used.element_size()),
               (full_table, columns * full_table.element_size())]
@@ -130,27 +134,27 @@ def _metadata_layout(req_map, requests, lengths, slots, mapping, full_table, swa
                 allow_subviews=True)
 
 
-@native(enabled=welm_decode_tiles_active, tile_layout=_metadata_layout)
+@native(enabled=_page_metadata_active, tile_layout=_metadata_layout)
 @triton.jit
 def _prepare_flash_pages(req_map, requests, lengths, slots, mapping, full_table,
                          swa_table, swa_slots, q_used, kv_used, req_stride: tl.constexpr,
                          context: tl.constexpr, map_size: tl.constexpr, columns: tl.constexpr,
-                         lanes: tl.constexpr, hybrid: tl.constexpr):
+                         lanes: tl.constexpr, hybrid: tl.constexpr, page_shift: tl.constexpr):
     row = tl.program_id(0)
     logical = tl.arange(0, lanes)
-    pos = logical * 64
+    pos = logical << page_shift
     n = tl.load(lengths + row)
     req = tl.load(requests + row).to(tl.int64)
     live = (logical < columns) & (pos < n) & (pos < context)
     # Give masked lanes a valid address even on SIMD targets which load before selecting.
     off = tl.where(live, req * req_stride + pos, 0)
     full = tl.where(live, tl.load(req_map + off), 0).to(tl.int64)
-    tl.store(full_table + row * columns + logical, full >> 6, mask=logical < columns)
+    tl.store(full_table + row * columns + logical, full >> page_shift, mask=logical < columns)
     if hybrid:
         # The allocator appends a sentinel so tensor index -1 maps to its last element.
         idx = tl.where(full < 0, full + map_size, full)
         swa = tl.load(mapping + idx).to(tl.int64)
-        tl.store(swa_table + row * columns + logical, tl.where(live, swa >> 6, 0),
+        tl.store(swa_table + row * columns + logical, tl.where(live, swa >> page_shift, 0),
                  mask=logical < columns)
         slot = tl.where(n > 0, tl.load(slots + row), 0).to(tl.int64)
         mapped = tl.load(mapping + tl.where(slot < 0, slot + map_size, slot))
@@ -160,20 +164,20 @@ def _prepare_flash_pages(req_map, requests, lengths, slots, mapping, full_table,
 
 
 def prepare_flash_pages(req_map, requests, lengths, slots, full_table, q_used, kv_used,
-                        mapping=None, swa_table=None, swa_slots=None):
-    if not welm_decode_tiles_active() or req_map.device.type != "npu":
+                        mapping=None, swa_table=None, swa_slots=None, *, page_size=64):
+    if page_size not in (64, 128) or not _page_metadata_active() or req_map.device.type != "npu":
         return False
     hybrid = mapping is not None
     if hybrid != (swa_table is not None) or hybrid != (swa_slots is not None):
         return False
-    if requests is None or requests.ndim != 1 or requests.shape[0] not in _DECODE_BATCH_SIZES:
+    if requests is None or requests.ndim != 1 or requests.shape[0] not in (1, 2, 4, 8, 12, 16):
         return False
     rows = requests.shape[0]
     vectors = (requests, lengths, slots, q_used, kv_used)
     if (any(t is None or t.shape != (rows,) for t in vectors)
             or req_map.ndim != 2 or req_map.stride(1) != 1
             or full_table.ndim != 2 or full_table.shape[0] != rows
-            or not 1 <= full_table.shape[1] <= 64
+            or not 1 <= full_table.shape[1] <= (2048 if page_size == 128 else 64)
             or not torch.npu.get_device_name(req_map.device).startswith("Ascend950")):
         return False
     buffers = (*vectors, full_table)
@@ -189,6 +193,6 @@ def prepare_flash_pages(req_map, requests, lengths, slots, full_table, q_used, k
     _prepare_flash_pages[(rows,)](
         req_map, requests, lengths, slots, mapping, full_table, swa_table, swa_slots,
         q_used, kv_used, req_map.stride(0), req_map.shape[1], mapping.numel() if hybrid else 0,
-        columns, triton.next_power_of_2(columns), hybrid,
+        columns, triton.next_power_of_2(columns), hybrid, page_size.bit_length() - 1,
     )
     return True

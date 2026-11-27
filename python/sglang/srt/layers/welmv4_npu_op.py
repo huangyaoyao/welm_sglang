@@ -2749,20 +2749,14 @@ def welmv4_oe_hash_decode_4way_npu(
         or column_starts.numel() < batch_size
     ):
         raise ValueError("decode metadata must contain at least batch_size entries")
-    output, launch_options = _welmv4_oe_hash_output(
-        batch_size, block_b, input_ids.device, can_pad=token_table.numel() > 0
-    )
-    if batch_size == 0:
-        return output
-    # One exact-width program writes each plane of the original compact tensor.
-    # Without a masked tail, Triton can compile the original JIT as a SIMD child.
+    # A single program owns all four planes, including tail padding on BS12.
     from sglang.srt.hardware_backend.npu.graph_runner.welm_tile_layouts import (
         welm_native_ops_only_active,
     )
 
     if (
         welm_native_ops_only_active()
-        and batch_size in (1, 2, 4, 8)
+        and batch_size in (1, 2, 4, 8, 12, 16)
         and block_b == 128
         and input_ids.device.type == "npu"
         and torch.npu.get_device_name(input_ids.device).startswith("Ascend950")
@@ -2772,8 +2766,16 @@ def welmv4_oe_hash_decode_4way_npu(
         and all(t.device == input_ids.device and t.is_contiguous()
                 for t in (input_ids, token_table, req_pool_indices, column_starts))
     ):
-        block_b = batch_size
+        block_b = triton.next_power_of_2(batch_size)
+        # The 12-row bucket needs four padding lanes in each hash plane.
+        output = torch.empty((_WELMV4_OE_BRANCHES, block_b), dtype=torch.int32, device=input_ids.device)
         launch_options = dict(PADDED_OUTPUT=True, compile_mode="simd")
+    else:
+        output, launch_options = _welmv4_oe_hash_output(
+            batch_size, block_b, input_ids.device, can_pad=token_table.numel() > 0
+        )
+        if batch_size == 0:
+            return output
     num_tasks = triton.cdiv(batch_size, block_b)
     _welmv4_oe_hash_decode_4way_kernel[
         _welmv4_1d_grid(num_tasks, input_ids.device)

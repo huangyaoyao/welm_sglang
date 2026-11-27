@@ -225,6 +225,38 @@ class WelmNativeBackendTest(unittest.TestCase):
                     self.assertFalse(layouts.welm_original_kernels_active())
                     self.assertFalse(layouts.welm_native_gate_first_active())
 
+    def test_ep_native_capture_policy(self):
+        from collections import namedtuple
+
+        key = namedtuple("Key", "size")(4)
+        fixed = sys.modules["megakernel._fixed"]
+        retained = []
+
+        def capture(fn, directory, *, prepared, tile_chains, retain_intermediates=False, workspace_pool=None):
+            retained.append(retain_intermediates)
+            return self.plan
+
+        for tp, dp, ep in ((4, 4, 4), (8, 8, 8), (4, 1, 4)):
+            for enabled in (False, True):
+                with self.subTest(tp=tp, dp=dp, ep=ep, enabled=enabled):
+                    runner = self.runner("WeLMV4MoeForCausalLM")
+                    args = runner.model_runner.server_args
+                    args.tp_size, args.dp_size, args.ep_size = tp, dp, ep
+                    settings = {"SGLANG_NPU_WELMV4_MK_NATIVE_OPS_ONLY": str(int(enabled)),
+                                "MK_NATIVE_TILE_DEPENDENCIES": "1",
+                                "SGLANG_NPU_WELMV4_MK_SHARE_DECODE_WORKSPACE": "1"}
+                    pool_module = SimpleNamespace(FixedWorkspacePool=lambda: SimpleNamespace(capture_session=nullcontext))
+                    with patch.dict(sys.modules, {"megakernel._workspace_pool": pool_module}), patch.dict(os.environ, settings), patch.object(fixed, "capture_fixed", capture):
+                        backend = self.backend_cls(runner)
+                        scope = Mock(return_value=nullcontext())
+                        with patch.dict(backend.capture_one.__globals__, decode_tile_scope=scope):
+                            backend.capture_one(key, lambda: None)
+                    admitted = dp == tp and enabled
+                    scope.assert_called_once_with(single_pk=False, native_ops_only=admitted,
+                                                  batch=4 if dp == tp else None)
+                    self.assertEqual(retained[-1], admitted)
+                    self.assertEqual(backend._workspace_pool is not None, admitted)
+
     def test_candidate_regions_exclude_quantized_and_fp16_dtypes(self):
         for dtype, quant, expected in (("bf16", None, True), ("fp16", None, False), ("bf16", "fp8", False)):
             with self.subTest(dtype=dtype, quant=quant):
